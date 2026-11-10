@@ -26,7 +26,7 @@ service = PhotoService(settings)
 app = FastAPI(
     title="FrameBucket Data Service",
     version="0.1.0",
-    description="Local-first gallery and photo-processing service.",
+    description="Gallery and photo-processing service with local, S3-compatible, and Google Drive storage.",
 )
 
 
@@ -234,7 +234,7 @@ def get_preview(
     customer_id: str = Query(min_length=1, max_length=128),
 ) -> Response:
     try:
-        path = service.preview_path(event_id, photo_id, customer_id)
+        path, cleanup = service.preview_path(event_id, photo_id, customer_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
@@ -242,10 +242,17 @@ def get_preview(
     headers = {"Cache-Control": "private, no-store", "Accept-Ranges": "bytes"}
     range_header = request.headers.get("range")
     if not range_header:
-        return FileResponse(path, media_type=media_type, headers=headers)
+        return FileResponse(
+            path,
+            media_type=media_type,
+            headers=headers,
+            background=BackgroundTask(lambda: path.unlink(missing_ok=True)) if cleanup else None,
+        )
 
     match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
     if not match or size == 0 or (not match.group(1) and not match.group(2)):
+        if cleanup:
+            path.unlink(missing_ok=True)
         return Response(status_code=416, headers={**headers, "Content-Range": f"bytes */{size}"})
     if match.group(1):
         start = int(match.group(1))
@@ -255,6 +262,8 @@ def get_preview(
         start = max(0, size - suffix_length)
         end = size - 1
     if start >= size or end < start:
+        if cleanup:
+            path.unlink(missing_ok=True)
         return Response(status_code=416, headers={**headers, "Content-Range": f"bytes */{size}"})
     end = min(end, size - 1)
     length = end - start + 1
@@ -279,6 +288,7 @@ def get_preview(
             "Content-Length": str(length),
             "Content-Range": f"bytes {start}-{end}/{size}",
         },
+        background=BackgroundTask(lambda: path.unlink(missing_ok=True)) if cleanup else None,
     )
 
 
@@ -293,11 +303,19 @@ def get_original(
     customer_id: str = Query(min_length=1, max_length=128),
 ) -> FileResponse:
     try:
-        path = service.original_path_for_photographer(event_id, photo_id, photographer_id, customer_id)
+        path, cleanup, original_filename = service.original_path_for_photographer(
+            event_id, photo_id, photographer_id, customer_id
+        )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    return FileResponse(path, media_type=media_type, filename=path.name, headers={"Cache-Control": "private, no-store"})
+    return FileResponse(
+        path,
+        media_type=media_type,
+        filename=original_filename,
+        headers={"Cache-Control": "private, no-store"},
+        background=BackgroundTask(lambda: path.unlink(missing_ok=True)) if cleanup else None,
+    )
 
 
 @app.post(
@@ -319,7 +337,7 @@ def submit_album(event_id: str, payload: AlbumSubmissionCreate) -> dict:
 @app.get("/api/v1/album-design/{token}")
 def download_album_design(token: str) -> FileResponse:
     try:
-        path, filename = service.resolve_album_link(token)
+        path, filename, cleanup = service.resolve_album_link(token)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return FileResponse(
@@ -327,4 +345,5 @@ def download_album_design(token: str) -> FileResponse:
         media_type="application/zip",
         filename=filename,
         headers={"Cache-Control": "private, no-store"},
+        background=BackgroundTask(lambda: path.unlink(missing_ok=True)) if cleanup else None,
     )

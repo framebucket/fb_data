@@ -10,6 +10,11 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115,<1",
+    "boto3>=1.35,<2",
+    "google-api-python-client>=2.150,<3",
+    "google-auth>=2.35,<3",
+    "google-auth-httplib2>=0.2,<1",
+    "google-auth-oauthlib>=1.2,<2",
     "numpy>=1.26",
     "opencv-python-headless>=4.10,<5",
     "pillow>=10.4,<13",

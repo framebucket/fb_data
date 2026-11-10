@@ -1,6 +1,6 @@
 # FrameBucket Data Service
 
-Python microservice for FrameBucket gallery media. The first working slice is local image upload, original preservation, preview processing, and album-design handoff.
+Python microservice for FrameBucket gallery media, with local, S3-compatible, and Google Drive storage backends. It handles image/video upload, original preservation, preview processing, and album-design handoff.
 
 ## Implemented
 
@@ -43,6 +43,30 @@ uvicorn app.api:app --host 127.0.0.1 --port 8001
 4. Start the Spring Boot backend with `DATA_SERVICE_TOKEN` set to the same token, then start the React frontend as usual. The Data tab requires a plan with Data enabled. Events can be provisioned when created; if the Python service was offline, opening that event gallery provisions its storage.
 
 For Railway/Railpack deployment, build from the root of this Python service repository (the directory containing `pyproject.toml` and `railpack.json`). The Railpack config starts `app.api:app` with Uvicorn on `0.0.0.0:$PORT`.
+
+## Choose persistent storage
+
+Set `FB_STORAGE_BACKEND` to `local`, `s3`, or `google_drive`. The default `local` backend is intended for local development or a persistent mounted volume. Railway Buckets use Railway's S3-compatible endpoint and credentials, so select `s3`; the endpoint URL alone is not a filesystem mount. The service stores event records, folder lists, manifests, private originals, processed gallery media, temporary album selections, album originals, and ZIP files in the selected backend. Image processing and responses still use `FB_TEMP_ROOT` (or the system temporary directory for remote backends), which must have enough writable space for the largest in-flight upload and archive.
+
+For a Railway Bucket, configure these variables on the Python service:
+
+~~~text
+FB_STORAGE_BACKEND=s3
+FB_S3_ENDPOINT_URL=<bucket endpoint URL>
+FB_S3_BUCKET=<bucket name>
+FB_S3_REGION=<bucket region>
+FB_S3_ACCESS_KEY_ID=<access key>
+FB_S3_SECRET_ACCESS_KEY=<secret key>
+FB_S3_PREFIX=framebucket
+~~~
+
+Set Railway's Bucket variable references `ENDPOINT`, `BUCKET`, `REGION`, `ACCESS_KEY_ID`, and `SECRET_ACCESS_KEY` on the Python service. With `FB_STORAGE_BACKEND=s3`, the adapter reads those native names directly; alternatively, map them to the corresponding `FB_S3_*` variables. Railway's endpoint is normally the base endpoint `https://t3.storageapi.dev`; use `BUCKET` (the S3 bucket name), not the display-name variable. Railway uses virtual-hosted URLs by default, which matches this adapter; set `FB_S3_ADDRESSING_STYLE=path` only if the Bucket's Credentials panel says path style is required. `FB_S3_PREFIX` is optional and defaults to the bucket root. See [Railway's Bucket connection and variable reference](https://docs.railway.com/storage-buckets#connecting-to-your-bucket).
+
+For Google Drive, set `FB_STORAGE_BACKEND=google_drive` and configure `FB_GOOGLE_DRIVE_FOLDER_ID`, `FB_GOOGLE_CLIENT_ID`, `FB_GOOGLE_CLIENT_SECRET`, and `FB_GOOGLE_REFRESH_TOKEN`. `FB_GOOGLE_DRIVE_FOLDER_ID` accepts either the folder ID or its full `https://drive.google.com/drive/folders/...` URL. Create a Desktop OAuth client in Google Cloud, enable the Drive API, then authorize the Google account that has editor access to the destination folder. From this repository, run `python scripts/get_google_drive_refresh_token.py --client-secrets <downloaded-oauth-client.json>` to obtain a refresh token. Put the OAuth client ID/secret and generated refresh token into the Python service's environment variables. A public/editor share URL by itself is not an API credential. This backend uses that OAuth identity to read and write files inside the configured folder; it does not make the stored files public. It requests the broad `drive` scope so it can locate the configured folder and manage its contents; Google treats this as a restricted scope and may require verification for a public production app. An external app left in OAuth Testing mode can receive refresh tokens that expire after seven days.
+
+Keep one active data-service instance per local filesystem deployment. For S3 and Drive, the data is remotely stored, but this service currently keeps per-event write locks in process memory; run one writer instance or add a distributed lock/database before horizontal scaling.
+
+Changing `FB_STORAGE_BACKEND` does not move files already stored under `FB_DATA_ROOT`. To copy existing local gallery data into the configured remote destination, run `scripts/migrate_local_storage.py` from this repository while `FB_DATA_ROOT` still points to the old data directory and the remote backend variables are set. The script copies metadata, originals, previews, album files, and selection drafts; it skips keys already present unless `--overwrite` is supplied.
 
 To run the standalone local batch processor instead, use `python -m app.cli --event-id DEMO_EVENT --photographer-id DEMO_PHOTOGRAPHER --customer-id DEMO_CUSTOMER`. Use `--input <folder>`, `--workers 4`, or `--json` to customize it.
 
@@ -102,4 +126,4 @@ data_output/
   tmp/                                    # temporary uploads, customer ZIPs, and album-selection drafts
 ~~~
 
-The filesystem adapter is for development only. The private photographer path is never returned by the customer gallery API. See INFRASTRUCTURE.md for the production design.
+The same logical key layout is used by all adapters. The private photographer path is never returned by the customer gallery API. See INFRASTRUCTURE.md for production considerations.

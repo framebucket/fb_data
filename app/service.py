@@ -16,7 +16,7 @@ from pathlib import Path
 
 from .config import Settings
 from .imaging import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, ImageProcessor
-from .storage import LocalStorage, safe_filename, validate_id
+from .storage import StorageBackend, create_storage, normalize_key, safe_filename, validate_id
 
 logger = logging.getLogger(__name__)
 
@@ -47,13 +47,8 @@ class PhotoResult:
 class PhotoService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.storage = LocalStorage(
-            settings.data_root,
-            settings.metadata_root,
-            settings.private_root,
-            settings.event_root,
-            settings.album_root,
-        )
+        self.storage: StorageBackend = create_storage(settings)
+        settings.temp_root.mkdir(parents=True, exist_ok=True)
         self.processor = ImageProcessor(
             logo_path=settings.logo_path,
             enhancer_model=settings.enhancer_model,
@@ -66,10 +61,10 @@ class PhotoService:
         customer_id = validate_id(customer_id, "customer_id")
         self.storage.prepare_event(photographer_id, event_id)
 
-        event_file = self.settings.metadata_root / event_id / "event.json"
+        event_key = self.storage.event_key(event_id)
         with self.storage.lock_for_event(event_id):
-            if event_file.exists():
-                existing = json.loads(event_file.read_text(encoding="utf-8"))
+            if self.storage.exists(event_key):
+                existing = self.storage.read_json(event_key)
                 if (
                     existing.get("photographer_id") != photographer_id
                     or existing.get("customer_id") != customer_id
@@ -86,9 +81,7 @@ class PhotoService:
                 "customer_gallery_key": f"events/{event_id}",
                 "photographer_originals_key": f"photographer/{photographer_id}/{event_id}/originals",
             }
-            temporary = event_file.with_name(event_file.name + ".tmp")
-            temporary.write_text(json.dumps(event, indent=2), encoding="utf-8")
-            temporary.replace(event_file)
+            self.storage.write_json(event_key, event)
             self.storage.write_manifest(event_id, {"event_id": event_id, "photos": []})
             return event
 
@@ -108,24 +101,19 @@ class PhotoService:
             folder = {"folder_id": uuid.uuid4().hex, "name": cleaned_name}
             folders.append(folder)
             self.storage.write_folders(event["event_id"], folders)
-            for kind in ("photos", "videos"):
-                (self.settings.event_root / event_id / kind / folder["folder_id"]).mkdir(parents=True, exist_ok=True)
-            (self.settings.private_root / photographer_id / event_id / "originals" / folder["folder_id"]).mkdir(parents=True, exist_ok=True)
             return folder
 
-    def _album_selection_path(self, event_id: str, customer_id: str) -> Path:
-        validate_id(event_id, "event_id")
-        validate_id(customer_id, "customer_id")
-        return self.settings.temp_root / "album-selections" / event_id / f"{customer_id}.json"
+    def _album_selection_key(self, event_id: str, customer_id: str) -> str:
+        return self.storage.album_selection_key(event_id, customer_id)
 
     def album_selection(self, event_id: str, photographer_id: str, customer_id: str) -> dict:
         self._owned_event(event_id, photographer_id, customer_id)
-        selection_path = self._album_selection_path(event_id, customer_id)
-        if not selection_path.is_file():
+        selection_key = self._album_selection_key(event_id, customer_id)
+        if not self.storage.exists(selection_key):
             return {"photo_ids": []}
         try:
-            saved = json.loads(selection_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            saved = self.storage.read_json(selection_key)
+        except (OSError, ValueError, json.JSONDecodeError):
             return {"photo_ids": []}
         available = {
             photo["photo_id"]
@@ -158,23 +146,17 @@ class PhotoService:
                 if photo.get("customer_id") != customer_id or photo.get("photographer_id") != photographer_id:
                     raise ValueError(f"Photo {photo_id} belongs to another customer.")
 
-            selection_path = self._album_selection_path(event_id, customer_id)
+            selection_key = self._album_selection_key(event_id, customer_id)
             if not unique_photo_ids:
-                selection_path.unlink(missing_ok=True)
+                self.storage.delete(selection_key)
                 return {"photo_ids": [], "photo_count": 0}
 
-            selection_path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = selection_path.with_name(selection_path.name + ".tmp")
-            temporary.write_text(
-                json.dumps({
+            self.storage.write_json(selection_key, {
                     "event_id": event_id,
                     "customer_id": customer_id,
                     "photo_ids": unique_photo_ids,
                     "updated_at": datetime.now(timezone.utc).isoformat(),
-                }, indent=2),
-                encoding="utf-8",
-            )
-            temporary.replace(selection_path)
+                })
             return {"photo_ids": unique_photo_ids, "photo_count": len(unique_photo_ids)}
 
     def download_gallery(
@@ -196,8 +178,7 @@ class PhotoService:
         if not selected:
             raise ValueError("There are no gallery photos available to download.")
 
-        event_file = self.settings.metadata_root / event_id / "event.json"
-        event = json.loads(event_file.read_text(encoding="utf-8"))
+        event = self._read_event(event_id)
         manifest_photos = {
             photo["photo_id"]: photo
             for photo in self.storage.read_manifest(event_id)["photos"]
@@ -206,9 +187,7 @@ class PhotoService:
             folder["folder_id"]: folder["name"]
             for folder in self.storage.read_folders(event_id)
         }
-        event_root = self.settings.event_root.resolve()
-
-        downloadable: list[tuple[dict, Path]] = []
+        downloadable: list[tuple[dict, Path, bool]] = []
         for photo in selected:
             manifest_photo = manifest_photos.get(photo["photo_id"])
             if (
@@ -217,19 +196,26 @@ class PhotoService:
                 or manifest_photo.get("status") not in {"READY", "SUBMITTED_FOR_ALBUM"}
             ):
                 raise ValueError("One or more selected photos are not available for download.")
-            path = (self.settings.data_root / manifest_photo["processed_key"]).resolve()
-            if not path.is_relative_to(event_root) or not path.is_file():
-                raise ValueError("A processed gallery photo is unavailable for download.")
-            downloadable.append((photo, path))
+            try:
+                key = self._validated_processed_key(event_id, manifest_photo)
+                path, cleanup = self.storage.materialize(key)
+            except Exception as exc:
+                for _, staged, remove in downloadable:
+                    if remove:
+                        staged.unlink(missing_ok=True)
+                if isinstance(exc, (FileNotFoundError, OSError, ValueError)):
+                    raise ValueError("A processed gallery photo is unavailable for download.") from exc
+                raise
+            downloadable.append((photo, path, cleanup))
 
         if len(downloadable) == 1:
-            photo, path = downloadable[0]
+            photo, path, cleanup = downloadable[0]
             original_name = Path(photo["original_filename"])
             filename = safe_filename(
                 f"{photo['photo_number']:05d}_{original_name.stem}{path.suffix or '.jpg'}"
             )
             media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-            return path, filename, media_type, False
+            return path, filename, media_type, cleanup
 
         self.settings.temp_root.mkdir(parents=True, exist_ok=True)
         file_descriptor, archive_name = tempfile.mkstemp(
@@ -241,7 +227,7 @@ class PhotoService:
                 with zipfile.ZipFile(
                     archive_file, "w", compression=zipfile.ZIP_STORED, allowZip64=True
                 ) as archive:
-                    for photo, path in downloadable:
+                    for photo, path, _ in downloadable:
                         folder_name = safe_filename(folder_names.get(photo.get("folder_id", "root"), "Gallery"))
                         original_name = Path(photo["original_filename"])
                         suffix = path.suffix or ".jpg"
@@ -254,18 +240,42 @@ class PhotoService:
         except Exception:
             archive_path.unlink(missing_ok=True)
             raise
+        finally:
+            for _, path, cleanup in downloadable:
+                if cleanup:
+                    path.unlink(missing_ok=True)
 
     def _owned_event(self, event_id: str, photographer_id: str, customer_id: str) -> dict:
         event_id = validate_id(event_id, "event_id")
         photographer_id = validate_id(photographer_id, "photographer_id")
         customer_id = validate_id(customer_id, "customer_id")
-        event_file = self.settings.metadata_root / event_id / "event.json"
-        if not event_file.is_file():
-            raise ValueError("Event not found.")
-        event = json.loads(event_file.read_text(encoding="utf-8"))
+        event = self._read_event(event_id)
         if event.get("photographer_id") != photographer_id or event.get("customer_id") != customer_id:
             raise ValueError("The event does not belong to the supplied photographer/customer.")
         return event
+
+    def _read_event(self, event_id: str) -> dict:
+        event_id = validate_id(event_id, "event_id")
+        try:
+            return self.storage.read_json(self.storage.event_key(event_id))
+        except FileNotFoundError as exc:
+            raise ValueError("Event not found.") from exc
+
+    @staticmethod
+    def _validated_processed_key(event_id: str, photo: dict) -> str:
+        key = normalize_key(photo.get("processed_key", ""))
+        if not key.startswith((f"events/{event_id}/photos/", f"events/{event_id}/videos/")):
+            raise ValueError("Processed photo not found.")
+        return key
+
+    @staticmethod
+    def _validated_original_key(event_id: str, photographer_id: str, photo: dict) -> str:
+        key = normalize_key(photo.get("original_key", ""))
+        private_prefix = f"photographer/{photographer_id}/{event_id}/originals/"
+        album_prefix = f"album_design/{event_id}/"
+        if not key.startswith((private_prefix, album_prefix)):
+            raise ValueError("Photographer original not found.")
+        return key
 
     def upload(
         self,
@@ -286,26 +296,21 @@ class PhotoService:
         media_type = "video" if extension in VIDEO_EXTENSIONS else "image"
         folder_id = validate_id(folder_id, "folder_id")
 
-        event_file = self.settings.metadata_root / event_id / "event.json"
-        if not event_file.exists():
+        try:
+            event = self._read_event(event_id)
+        except ValueError:
             self.create_event(event_id, photographer_id, customer_id)
         else:
-            event = json.loads(event_file.read_text(encoding="utf-8"))
-            if (
-                event.get("photographer_id") != photographer_id
-                or event.get("customer_id") != customer_id
-            ):
+            if event.get("photographer_id") != photographer_id or event.get("customer_id") != customer_id:
                 raise ValueError("The event does not belong to the supplied photographer/customer.")
 
         photo_id = uuid.uuid4().hex
         if not any(folder["folder_id"] == folder_id for folder in self.storage.read_folders(event_id)):
             raise ValueError("Folder not found for this event.")
-        original_path = self.storage.original_path(
+        original_key = self.storage.original_key(
             photographer_id, event_id, photo_id, original_filename, folder_id
         )
-        processed_path = self.storage.processed_path(event_id, photo_id, folder_id, original_filename)
-        relative_original = original_path.relative_to(self.settings.data_root).as_posix()
-        relative_processed = processed_path.relative_to(self.settings.data_root).as_posix()
+        processed_key = self.storage.processed_key(event_id, photo_id, folder_id, original_filename)
 
         with self.storage.lock_for_event(event_id):
             manifest = self.storage.read_manifest(event_id)
@@ -322,45 +327,37 @@ class PhotoService:
                 "original_filename": original_filename,
                 "media_type": media_type,
                 "folder_id": folder_id,
-                "original_key": relative_original,
-                "processed_key": relative_processed,
+                "original_key": original_key,
+                "processed_key": processed_key,
                 "status": "PROCESSING",
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
             manifest["photos"].append(record)
             self.storage.write_manifest(event_id, manifest)
 
-        def copy_original() -> None:
-            original_path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = original_path.with_name(original_path.name + ".tmp")
-            try:
-                shutil.copy2(source, temporary)
-                temporary.replace(original_path)
-            finally:
-                temporary.unlink(missing_ok=True)
-
+        self.settings.temp_root.mkdir(parents=True, exist_ok=True)
+        processed_path: Path | None = None
         try:
-            # Preserve the photographer's exact source while processing a
-            # separate read of that source at the same time.
-            def copy_gallery_video() -> dict:
-                processed_path.parent.mkdir(parents=True, exist_ok=True)
-                temporary = processed_path.with_name(processed_path.name + ".tmp")
-                try:
-                    shutil.copy2(source, temporary)
-                    temporary.replace(processed_path)
-                finally:
-                    temporary.unlink(missing_ok=True)
-                return {"width": None, "height": None, "bytes": processed_path.stat().st_size, "watermarked": False, "ai_enhanced": False}
-
+            with tempfile.NamedTemporaryFile(
+                prefix="processed-", suffix=Path(processed_key).suffix, dir=self.settings.temp_root, delete=False
+            ) as temporary:
+                processed_path = Path(temporary.name)
             with ThreadPoolExecutor(max_workers=2, thread_name_prefix="fb-photo") as pool:
-                original_future = pool.submit(copy_original)
-                process_future = (
-                    pool.submit(self.processor.process, source, processed_path)
-                    if media_type == "image"
-                    else pool.submit(copy_gallery_video)
-                )
+                original_future = pool.submit(self.storage.upload_file, original_key, source)
+                if media_type == "image":
+                    process_future = pool.submit(self.processor.process, source, processed_path)
+                else:
+                    process_future = None
+                    shutil.copy2(source, processed_path)
+                processing = process_future.result() if process_future else {
+                    "width": None,
+                    "height": None,
+                    "bytes": processed_path.stat().st_size,
+                    "watermarked": False,
+                    "ai_enhanced": False,
+                }
+                self.storage.upload_file(processed_key, processed_path)
                 original_future.result()
-                processing = process_future.result()
 
             with self.storage.lock_for_event(event_id):
                 manifest = self.storage.read_manifest(event_id)
@@ -382,8 +379,8 @@ class PhotoService:
                 photographer_id=photographer_id,
                 customer_id=customer_id,
                 original_filename=original_filename,
-                original_key=relative_original,
-                processed_key=relative_processed,
+                original_key=original_key,
+                processed_key=processed_key,
                 status="READY",
                 media_type=media_type,
                 folder_id=folder_id,
@@ -395,12 +392,19 @@ class PhotoService:
             )
         except Exception as exc:
             logger.exception("Photo processing failed for %s", photo_id)
+            try:
+                self.storage.delete(processed_key)
+            except Exception:
+                logger.exception("Failed to clean up processed storage key for %s", photo_id)
             with self.storage.lock_for_event(event_id):
                 manifest = self.storage.read_manifest(event_id)
                 saved = next(p for p in manifest["photos"] if p["photo_id"] == photo_id)
                 saved.update(status="PROCESSING_FAILED", error=str(exc)[:500])
                 self.storage.write_manifest(event_id, manifest)
             raise
+        finally:
+            if processed_path:
+                processed_path.unlink(missing_ok=True)
 
     def process_directory(
         self,
@@ -456,14 +460,8 @@ class PhotoService:
         if not unique_photo_ids:
             raise ValueError("Select at least one photo for album design.")
 
-        event_file = self.settings.metadata_root / event_id / "event.json"
-        if not event_file.exists():
-            raise ValueError("Event not found.")
-        event = json.loads(event_file.read_text(encoding="utf-8"))
-        if (
-            event.get("photographer_id") != photographer_id
-            or event.get("customer_id") != customer_id
-        ):
+        event = self._read_event(event_id)
+        if event.get("photographer_id") != photographer_id or event.get("customer_id") != customer_id:
             raise ValueError("The event does not belong to the supplied photographer/customer.")
 
         with self.storage.lock_for_event(event_id):
@@ -478,37 +476,51 @@ class PhotoService:
                     raise ValueError(f"Photo {photo_id} is not ready for album design.")
                 if photo.get("media_type", "image") != "image":
                     raise ValueError("Videos cannot be submitted for album design.")
-                if (
-                    photo.get("photographer_id") != photographer_id
-                    or photo.get("customer_id") != customer_id
-                ):
+                if photo.get("photographer_id") != photographer_id or photo.get("customer_id") != customer_id:
                     raise ValueError(f"Photo {photo_id} belongs to another customer.")
                 selected.append(photo)
 
             submission_id = uuid.uuid4().hex
             token = secrets.token_urlsafe(32)
-            album_directory = self.storage.create_album_directory(event_id, submission_id)
-            moved: list[tuple[dict, Path, Path]] = []
+            submission_prefix = f"album_design/{event_id}/{submission_id}"
+            archive_key = f"{submission_prefix}/album-design.zip"
+            submission_key = f"{submission_prefix}/submission.json"
+            created_keys: list[str] = []
+            staged_files: list[tuple[dict, Path, bool]] = []
+            archive_path: Path | None = None
             try:
                 for photo in selected:
-                    source = (self.settings.data_root / photo["original_key"]).resolve()
-                    expected_root = (
-                        self.settings.private_root / photographer_id / event_id
-                    ).resolve()
-                    if not source.is_relative_to(expected_root) or not source.is_file():
-                        raise ValueError("A selected photographer original is unavailable.")
-                    destination = self.storage.move_original_to_album(
-                        source, album_directory, photo["photo_id"], photo["photo_number"]
+                    source_key = self._validated_original_key(event_id, photographer_id, photo)
+                    try:
+                        source, cleanup = self.storage.materialize(
+                            source_key, suffix=Path(photo["original_filename"]).suffix
+                        )
+                    except (FileNotFoundError, OSError) as exc:
+                        raise ValueError("A selected photographer original is unavailable.") from exc
+                    staged_files.append((photo, source, cleanup))
+                    album_original_key = self.storage.album_submission_key(
+                        event_id,
+                        submission_id,
+                        f"{photo['photo_number']:05d}_{photo['original_filename']}",
                     )
-                    moved.append((photo, source, destination))
+                    self.storage.upload_file(album_original_key, source)
+                    created_keys.append(album_original_key)
 
-                archive_path = album_directory / "album-design.zip"
+                with tempfile.NamedTemporaryFile(
+                    prefix="album-design-", suffix=".zip", dir=self.settings.temp_root, delete=False
+                ) as temporary:
+                    archive_path = Path(temporary.name)
                 with zipfile.ZipFile(
                     archive_path, "w", compression=zipfile.ZIP_STORED, allowZip64=True
                 ) as archive:
-                    for photo, _, destination in moved:
-                        archive.write(destination, arcname=destination.name)
+                    for photo, source, _ in staged_files:
+                        entry_name = safe_filename(
+                            f"{photo['photo_number']:05d}_{photo['original_filename']}"
+                        )
+                        archive.write(source, arcname=entry_name)
 
+                self.storage.upload_file(archive_key, archive_path)
+                created_keys.append(archive_key)
                 expires_at = datetime.now(timezone.utc) + timedelta(days=30)
                 submission = {
                     "submission_id": submission_id,
@@ -521,33 +533,44 @@ class PhotoService:
                         {
                             "photo_number": photo["photo_number"],
                             "original_filename": photo["original_filename"],
+                            "folder_id": photo.get("folder_id", "root"),
                         }
                         for photo in selected
                     ],
                     "share_token": token,
                     "created_at": datetime.now(timezone.utc).isoformat(),
                     "expires_at": expires_at.isoformat(),
-                    "archive_key": archive_path.relative_to(self.settings.data_root).as_posix(),
+                    "archive_key": archive_key,
                 }
-                (album_directory / "submission.json").write_text(
-                    json.dumps(submission, indent=2), encoding="utf-8"
-                )
+                self.storage.write_json(submission_key, submission)
+                created_keys.append(submission_key)
 
-                for photo, _, destination in moved:
-                    photo["original_key"] = destination.relative_to(
-                        self.settings.data_root
-                    ).as_posix()
+                for photo in selected:
+                    photo["album_design_key"] = self.storage.album_submission_key(
+                        event_id,
+                        submission_id,
+                        f"{photo['photo_number']:05d}_{photo['original_filename']}",
+                    )
                     photo["album_submission_id"] = submission_id
                     photo["status"] = "SUBMITTED_FOR_ALBUM"
                 self.storage.write_manifest(event_id, manifest)
-                self._album_selection_path(event_id, customer_id).unlink(missing_ok=True)
+                try:
+                    self.storage.delete(self._album_selection_key(event_id, customer_id))
+                except Exception:
+                    logger.exception("Could not remove album selection draft for event %s", event_id)
             except Exception:
-                for _, source, destination in reversed(moved):
-                    if destination.exists():
-                        source.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.move(str(destination), str(source))
-                shutil.rmtree(album_directory, ignore_errors=True)
+                for key in reversed(created_keys):
+                    try:
+                        self.storage.delete(key)
+                    except Exception:
+                        logger.exception("Failed to clean up album storage key %s", key)
                 raise
+            finally:
+                for _, staged, cleanup in staged_files:
+                    if cleanup:
+                        staged.unlink(missing_ok=True)
+                if archive_path:
+                    archive_path.unlink(missing_ok=True)
 
         return {
             "submission_id": submission_id,
@@ -559,32 +582,43 @@ class PhotoService:
             "status": "SUBMITTED",
         }
 
-    def resolve_album_link(self, token: str) -> tuple[Path, str]:
+    def resolve_album_link(self, token: str) -> tuple[Path, str, bool]:
         if not token or len(token) > 200:
             raise FileNotFoundError("Album design link not found.")
-        for submission_file in self.settings.album_root.glob("*/*/submission.json"):
+        for submission_key in self.storage.list_keys("album_design/"):
+            if not submission_key.endswith("/submission.json"):
+                continue
             try:
-                submission = json.loads(submission_file.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+                submission = self.storage.read_json(submission_key)
+            except (OSError, ValueError, json.JSONDecodeError):
                 continue
             if not secrets.compare_digest(submission.get("share_token", ""), token):
                 continue
-            expires = datetime.fromisoformat(submission["expires_at"])
+            try:
+                expires = datetime.fromisoformat(submission["expires_at"])
+                archive_key = normalize_key(submission["archive_key"])
+                event_id = validate_id(submission["event_id"], "event_id")
+                submission_id = validate_id(submission["submission_id"], "submission_id")
+            except (KeyError, TypeError, ValueError) as exc:
+                raise FileNotFoundError("Album design archive not found.") from exc
             if expires <= datetime.now(timezone.utc):
                 raise FileNotFoundError("Album design link has expired.")
-            archive = (self.settings.data_root / submission["archive_key"]).resolve()
-            if not archive.is_file() or not archive.is_relative_to(self.settings.album_root.resolve()):
+            if not archive_key.startswith(f"album_design/{event_id}/{submission_id}/"):
                 raise FileNotFoundError("Album design archive not found.")
-            return archive, f"FrameBucket-{submission.get('event_code', submission['event_id'])}-album-design.zip"
+            try:
+                archive, cleanup = self.storage.materialize(
+                    archive_key, suffix=".zip", prefix="fb-album-"
+                )
+            except (FileNotFoundError, OSError) as exc:
+                raise FileNotFoundError("Album design archive not found.") from exc
+            event_code = safe_filename(submission.get("event_code", event_id))
+            return archive, f"FrameBucket-{event_code}-album-design.zip", cleanup
         raise FileNotFoundError("Album design link not found.")
 
     def list_gallery(self, event_id: str, customer_id: str, folder_id: str | None = None) -> list[dict]:
         event_id = validate_id(event_id, "event_id")
         customer_id = validate_id(customer_id, "customer_id")
-        event_file = self.settings.metadata_root / event_id / "event.json"
-        if not event_file.is_file():
-            raise ValueError("Event not found.")
-        event = json.loads(event_file.read_text(encoding="utf-8"))
+        event = self._read_event(event_id)
         if event.get("customer_id") != customer_id:
             raise ValueError("Customer does not have access to this event.")
         manifest = self.storage.read_manifest(event_id)
@@ -606,38 +640,40 @@ class PhotoService:
             and (folder_id is None or photo.get("folder_id", "root") == folder_id)
         ]
 
-    def media_path(self, event_id: str, photo_id: str, customer_id: str) -> Path:
+    def media_path(self, event_id: str, photo_id: str, customer_id: str) -> tuple[Path, bool]:
         event_id = validate_id(event_id, "event_id")
+        photo_id = validate_id(photo_id, "photo_id")
         customer_id = validate_id(customer_id, "customer_id")
-        event_file = self.settings.metadata_root / event_id / "event.json"
-        if not event_file.is_file():
-            raise ValueError("Event not found.")
-        event = json.loads(event_file.read_text(encoding="utf-8"))
+        event = self._read_event(event_id)
         if event.get("customer_id") != customer_id:
             raise ValueError("Customer does not have access to this event.")
         manifest = self.storage.read_manifest(event_id)
-        photo = next((p for p in manifest["photos"] if p["photo_id"] == photo_id), None)
+        photo = next((item for item in manifest["photos"] if item["photo_id"] == photo_id), None)
         if not photo or photo.get("status") not in {"READY", "SUBMITTED_FOR_ALBUM"}:
             raise ValueError("Processed photo not found.")
-        path = (self.settings.data_root / photo["processed_key"]).resolve()
-        if not path.is_relative_to(self.settings.event_root.resolve()) or not path.is_file():
-            raise ValueError("Processed photo not found.")
-        return path
+        key = self._validated_processed_key(event_id, photo)
+        try:
+            return self.storage.materialize(key)
+        except (FileNotFoundError, OSError) as exc:
+            raise ValueError("Processed photo not found.") from exc
 
-    def preview_path(self, event_id: str, photo_id: str, customer_id: str) -> Path:
+    def preview_path(self, event_id: str, photo_id: str, customer_id: str) -> tuple[Path, bool]:
         return self.media_path(event_id, photo_id, customer_id)
 
-    def original_path_for_photographer(self, event_id: str, photo_id: str, photographer_id: str, customer_id: str) -> Path:
+    def original_path_for_photographer(
+        self, event_id: str, photo_id: str, photographer_id: str, customer_id: str
+    ) -> tuple[Path, bool, str]:
         event = self._owned_event(event_id, photographer_id, customer_id)
+        photo_id = validate_id(photo_id, "photo_id")
         manifest = self.storage.read_manifest(event["event_id"])
         photo = next((item for item in manifest["photos"] if item["photo_id"] == photo_id), None)
         if not photo or photo.get("photographer_id") != photographer_id:
             raise ValueError("Photographer original not found.")
-        path = (self.settings.data_root / photo["original_key"]).resolve()
-        allowed_roots = [
-            (self.settings.private_root / photographer_id / event_id).resolve(),
-            (self.settings.album_root / event_id).resolve(),
-        ]
-        if not any(path.is_relative_to(root) for root in allowed_roots) or not path.is_file():
-            raise ValueError("Photographer original not found.")
-        return path
+        key = self._validated_original_key(event_id, photographer_id, photo)
+        try:
+            path, cleanup = self.storage.materialize(
+                key, suffix=Path(photo["original_filename"]).suffix
+            )
+            return path, cleanup, safe_filename(photo["original_filename"])
+        except (FileNotFoundError, OSError) as exc:
+            raise ValueError("Photographer original not found.") from exc
