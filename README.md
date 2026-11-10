@@ -42,6 +42,8 @@ uvicorn app.api:app --host 127.0.0.1 --port 8001
 
 4. Start the Spring Boot backend with `DATA_SERVICE_TOKEN` set to the same token, then start the React frontend as usual. The Data tab requires a plan with Data enabled. Events can be provisioned when created; if the Python service was offline, opening that event gallery provisions its storage.
 
+For Railway/Railpack deployment, build from the root of this Python service repository (the directory containing `pyproject.toml` and `railpack.json`). The Railpack config starts `app.api:app` with Uvicorn on `0.0.0.0:$PORT`.
+
 To run the standalone local batch processor instead, use `python -m app.cli --event-id DEMO_EVENT --photographer-id DEMO_PHOTOGRAPHER --customer-id DEMO_CUSTOMER`. Use `--input <folder>`, `--workers 4`, or `--json` to customize it.
 
 ## Optional AI enhancement
