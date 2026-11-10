@@ -12,9 +12,13 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from pathlib import Path
 
+from PIL import Image, ImageOps
+
 from .config import Settings
+from .face_matching import MAX_IMAGE_PIXELS, EventFaceMatcher
 from .imaging import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, ImageProcessor
 from .storage import StorageBackend, create_storage, normalize_key, safe_filename, validate_id
 
@@ -54,6 +58,155 @@ class PhotoService:
             enhancer_model=settings.enhancer_model,
             max_processed_bytes=settings.max_processed_bytes,
         )
+        self.face_matcher = EventFaceMatcher(settings)
+
+    def register_guest_face(
+        self,
+        event_id: str,
+        guest_id: str,
+        customer_id: str,
+        selfie_bytes: bytes,
+    ) -> dict:
+        event_id = validate_id(event_id, "event_id")
+        guest_id = validate_id(guest_id, "guest_id")
+        customer_id = validate_id(customer_id, "customer_id")
+        if not self.settings.face_matching_enabled:
+            raise ValueError("Event face matching is disabled on the Python data service.")
+        event = self._read_event(event_id)
+        if event.get("customer_id") != customer_id:
+            raise ValueError("The event does not belong to the supplied customer.")
+
+        embedding = self.face_matcher.selfie_embedding(selfie_bytes)
+        matching_photo_ids: list[str] = []
+        with self.storage.lock_for_event(event_id):
+            manifest = self.storage.read_manifest(event_id)
+            face_index = self.storage.read_json(
+                self.storage.face_index_key(event_id),
+                {"event_id": event_id, "guests": {}, "photos": {}},
+            )
+            guests = face_index.setdefault("guests", {})
+            photos = face_index.setdefault("photos", {})
+            for photo in manifest.get("photos", []):
+                if (
+                    photo.get("customer_id") != customer_id
+                    or photo.get("status") not in {"READY", "SUBMITTED_FOR_ALBUM"}
+                    or photo.get("media_type") == "video"
+                ):
+                    continue
+                key = self._validated_processed_key(event_id, photo)
+                photo_id = photo["photo_id"]
+                photo_embeddings = photos.get(photo_id)
+                if not isinstance(photo_embeddings, list):
+                    path, cleanup = self.storage.materialize(key, suffix=".jpg")
+                    try:
+                        photo_embeddings = self.face_matcher.face_embeddings(path.read_bytes())
+                    finally:
+                        if cleanup:
+                            path.unlink(missing_ok=True)
+                    photos[photo_id] = photo_embeddings
+                if guest_id in self.face_matcher.matching_guest_embeddings(
+                    photo_embeddings, {guest_id: embedding}
+                ):
+                    matching_photo_ids.append(photo_id)
+
+            guests[guest_id] = embedding
+            self.storage.write_json(self.storage.face_index_key(event_id), face_index)
+
+        return {"guest_id": guest_id, "matched_photo_ids": matching_photo_ids}
+
+    def match_uploaded_photo_faces(self, event_id: str, photo_id: str, customer_id: str) -> list[str]:
+        if not self.settings.face_matching_enabled:
+            return []
+        event_id = validate_id(event_id, "event_id")
+        photo_id = validate_id(photo_id, "photo_id")
+        customer_id = validate_id(customer_id, "customer_id")
+        event = self._read_event(event_id)
+        if event.get("customer_id") != customer_id:
+            raise ValueError("The event does not belong to the supplied customer.")
+        with self.storage.lock_for_event(event_id):
+            face_index = self.storage.read_json(
+                self.storage.face_index_key(event_id),
+                {"event_id": event_id, "guests": {}, "photos": {}},
+            )
+            guests = face_index.get("guests", {})
+            if not guests:
+                return []
+            manifest = self.storage.read_manifest(event_id)
+            photo = next((item for item in manifest.get("photos", []) if item.get("photo_id") == photo_id), None)
+            if (
+                not photo
+                or photo.get("customer_id") != customer_id
+                or photo.get("status") not in {"READY", "SUBMITTED_FOR_ALBUM"}
+                or photo.get("media_type") == "video"
+            ):
+                return []
+            path, cleanup = self.storage.materialize(self._validated_processed_key(event_id, photo), suffix=".jpg")
+            try:
+                photo_embeddings = self.face_matcher.face_embeddings(path.read_bytes())
+                face_index.setdefault("photos", {})[photo_id] = photo_embeddings
+                matched_guest_ids = self.face_matcher.matching_guest_embeddings(photo_embeddings, guests)
+                self.storage.write_json(self.storage.face_index_key(event_id), face_index)
+                return matched_guest_ids
+            finally:
+                if cleanup:
+                    path.unlink(missing_ok=True)
+
+    def delete_guest_face(self, event_id: str, guest_id: str, customer_id: str) -> None:
+        event_id = validate_id(event_id, "event_id")
+        guest_id = validate_id(guest_id, "guest_id")
+        customer_id = validate_id(customer_id, "customer_id")
+        event = self._read_event(event_id)
+        if event.get("customer_id") != customer_id:
+            raise ValueError("The event does not belong to the supplied customer.")
+        with self.storage.lock_for_event(event_id):
+            key = self.storage.face_index_key(event_id)
+            face_index = self.storage.read_json(key, {"event_id": event_id, "guests": {}})
+            face_index.get("guests", {}).pop(guest_id, None)
+            self.storage.write_json(key, face_index)
+
+    def whatsapp_preview_bytes(self, event_id: str, photo_id: str, customer_id: str) -> bytes:
+        event_id = validate_id(event_id, "event_id")
+        photo_id = validate_id(photo_id, "photo_id")
+        customer_id = validate_id(customer_id, "customer_id")
+        event = self._read_event(event_id)
+        if event.get("customer_id") != customer_id:
+            raise ValueError("The event does not belong to the supplied customer.")
+        manifest = self.storage.read_manifest(event_id)
+        photo = next((item for item in manifest.get("photos", []) if item.get("photo_id") == photo_id), None)
+        if (
+            not photo
+            or photo.get("customer_id") != customer_id
+            or photo.get("status") not in {"READY", "SUBMITTED_FOR_ALBUM"}
+            or photo.get("media_type") == "video"
+        ):
+            raise ValueError("The requested event photo is not available.")
+        path, cleanup = self.storage.materialize(self._validated_processed_key(event_id, photo), suffix=".jpg")
+        try:
+            max_bytes = 4_800_000
+            if path.stat().st_size <= max_bytes:
+                return path.read_bytes()
+            with Image.open(path) as source:
+                if source.width * source.height > MAX_IMAGE_PIXELS:
+                    raise ValueError("The processed photo is too large to prepare for WhatsApp.")
+                image = ImageOps.exif_transpose(source).convert("RGB")
+            for max_side in (None, 4000, 3200, 2560, 2048):
+                candidate = image
+                if max_side and max(image.size) > max_side:
+                    ratio = max_side / max(image.size)
+                    candidate = image.resize(
+                        (max(1, round(image.width * ratio)), max(1, round(image.height * ratio))),
+                        Image.Resampling.LANCZOS,
+                    )
+                for quality in (94, 91, 88, 85, 82, 78):
+                    output = BytesIO()
+                    candidate.save(output, format="JPEG", quality=quality, optimize=True, progressive=True)
+                    result = output.getvalue()
+                    if len(result) <= max_bytes:
+                        return result
+            raise ValueError("The photo could not be reduced to WhatsApp's image-size limit.")
+        finally:
+            if cleanup:
+                path.unlink(missing_ok=True)
 
     def create_event(self, event_id: str, photographer_id: str, customer_id: str, event_code: str | None = None) -> dict:
         event_id = validate_id(event_id, "event_id")

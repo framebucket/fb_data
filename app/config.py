@@ -56,6 +56,11 @@ class Settings:
     google_client_id: str | None
     google_client_secret: str | None
     google_refresh_token: str | None
+    face_matching_enabled: bool
+    face_model_dir: Path
+    face_detector_model_url: str
+    face_recognizer_model_url: str
+    face_match_threshold: float
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -99,6 +104,17 @@ class Settings:
             google_client_id=os.getenv("FB_GOOGLE_CLIENT_ID", "").strip() or None,
             google_client_secret=os.getenv("FB_GOOGLE_CLIENT_SECRET", "").strip() or None,
             google_refresh_token=os.getenv("FB_GOOGLE_REFRESH_TOKEN", "").strip() or None,
+            face_matching_enabled=os.getenv("FB_FACE_MATCHING_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"},
+            face_model_dir=_path_from_env("FB_FACE_MODEL_DIR", temp_root / "face-models"),
+            face_detector_model_url=os.getenv(
+                "FB_FACE_DETECTOR_MODEL_URL",
+                "https://github.com/opencv/opencv_zoo/raw/refs/heads/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx",
+            ).strip(),
+            face_recognizer_model_url=os.getenv(
+                "FB_FACE_RECOGNIZER_MODEL_URL",
+                "https://github.com/opencv/opencv_zoo/raw/refs/heads/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx",
+            ).strip(),
+            face_match_threshold=float(os.getenv("FB_FACE_MATCH_THRESHOLD", "0.42")),
         )
 
     @property

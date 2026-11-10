@@ -59,6 +59,9 @@ class StorageBackend:
     def folders_key(self, event_id: str) -> str:
         return f"metadata/events/{validate_id(event_id, 'event_id')}/folders.json"
 
+    def face_index_key(self, event_id: str) -> str:
+        return f"metadata/events/{validate_id(event_id, 'event_id')}/face-index.json"
+
     def original_key(
         self, photographer_id: str, event_id: str, photo_id: str,
         filename: str, folder_id: str = "root",

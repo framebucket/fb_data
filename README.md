@@ -12,6 +12,7 @@ Python microservice for FrameBucket gallery media, with local, S3-compatible, an
 - Places the photographer logo in a low-texture corner that does not overlap detected faces. If face detection is unavailable or no safe corner exists, the logo is skipped.
 - Submits selected photo IDs for album design, moves those originals into a private album-design folder, and creates a random expiring ZIP link.
 - Provides a protected FastAPI API for the existing app backend.
+- Supports opt-in, per-event face matching for guest QR check-in. Face embeddings are stored with that event's metadata; uploaded selfies are processed in memory and are not saved as gallery media.
 
 The local gallery is integrated with the FrameBucket Spring Boot app. It supports photographer folders, image and video upload, parallel original/preview writes, customer preview galleries, photo selection, and album-design ZIP handoff. WhatsApp delivery uses the app's existing console mode locally; configure an approved WhatsApp template for live delivery. Production queueing and object storage are described in [INFRASTRUCTURE.md](INFRASTRUCTURE.md).
 
@@ -65,6 +66,25 @@ Set Railway's Bucket variable references `ENDPOINT`, `BUCKET`, `REGION`, `ACCESS
 For Google Drive, set `FB_STORAGE_BACKEND=google_drive` and configure `FB_GOOGLE_DRIVE_FOLDER_ID`, `FB_GOOGLE_CLIENT_ID`, `FB_GOOGLE_CLIENT_SECRET`, and `FB_GOOGLE_REFRESH_TOKEN`. `FB_GOOGLE_DRIVE_FOLDER_ID` accepts either the folder ID or its full `https://drive.google.com/drive/folders/...` URL. Create a Desktop OAuth client in Google Cloud, enable the Drive API, then authorize the Google account that has editor access to the destination folder. From this repository, run `python scripts/get_google_drive_refresh_token.py --client-secrets <downloaded-oauth-client.json>` to obtain a refresh token. Put the OAuth client ID/secret and generated refresh token into the Python service's environment variables. A public/editor share URL by itself is not an API credential. This backend uses that OAuth identity to read and write files inside the configured folder; it does not make the stored files public. It requests the broad `drive` scope so it can locate the configured folder and manage its contents; Google treats this as a restricted scope and may require verification for a public production app. An external app left in OAuth Testing mode can receive refresh tokens that expire after seven days.
 
 Keep one active data-service instance per local filesystem deployment. For S3 and Drive, the data is remotely stored, but this service currently keeps per-event write locks in process memory; run one writer instance or add a distributed lock/database before horizontal scaling.
+
+## Guest QR face matching
+
+The Spring application creates a random guest link for each event and makes a downloadable QR image available to its photographer. Guests open the link, enter a name and Indian WhatsApp number, upload one selfie, and must agree to both event-only face matching and WhatsApp delivery. The data service stores normalized embeddings for enrolled guests and detected faces in that event's processed photos under the event's metadata key. It caches each photo's face embeddings, so later guest registrations compare against the cache and new uploads are scanned once. A guest can remove their face profile from the open check-in page; removal deletes the guest embedding and queued deliveries. The selfie itself is not written to the data bucket.
+
+Set FB_FACE_MATCHING_ENABLED=true on the Python service (the default). The YuNet detector and SFace recognizer are downloaded from OpenCV Zoo on first use. Set FB_FACE_MODEL_DIR to a directory on a persistent Railway volume if you want to keep the model files across container restarts. The model URL settings default to OpenCV Zoo and are only needed when you mirror or mount model files:
+
+~~~text
+FB_FACE_MODEL_DIR=/data/face-models
+FB_FACE_DETECTOR_MODEL_URL=https://github.com/opencv/opencv_zoo/raw/refs/heads/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx
+FB_FACE_RECOGNIZER_MODEL_URL=https://github.com/opencv/opencv_zoo/raw/refs/heads/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx
+FB_FACE_MATCH_THRESHOLD=0.42
+~~~
+
+Matching runs only within one event and uses the processed gallery image. A match is an automated estimate and may miss a face or match incorrectly; have the photographer review the workflow before relying on it for delivery. Models load lazily when the first guest registers; ensure the data service can download them or prepopulate the model directory. If model setup fails, registration reports that face matching is temporarily unavailable; normal event photo uploads remain available.
+
+The backend sends a matched image using an approved WhatsApp Cloud API template with an image header and three body placeholders. WhatsApp image messages have a size limit, so the data service keeps an image unchanged when it fits and otherwise makes a high-quality JPEG within the limit, reducing dimensions only as needed. This is a WhatsApp image delivery, not a promise of the original file's exact quality or WhatsApp's in-app HD toggle. See [WhatsApp template setup](../../fb_main/fb_main/backend/WHATSAPP_TEMPLATES.md#matched-event-photo-delivery).
+
+The QR contains a bearer link; anyone who scans or receives it can open the guest form. Deploy the React app with an SPA rewrite for /event-checkin/*. Set APP_FRONTEND_BASE_URL on the Java backend to that public frontend origin. If the domain currently serves only a coming-soon page, use the public URL of the deployed React app until the main app is routed to the domain.
 
 Changing `FB_STORAGE_BACKEND` does not move files already stored under `FB_DATA_ROOT`. To copy existing local gallery data into the configured remote destination, run `scripts/migrate_local_storage.py` from this repository while `FB_DATA_ROOT` still points to the old data directory and the remote backend variables are set. The script copies metadata, originals, previews, album files, and selection drafts; it skips keys already present unless `--overwrite` is supplied.
 

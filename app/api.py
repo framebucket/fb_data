@@ -22,6 +22,7 @@ from .storage import safe_filename
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 settings = Settings.from_env()
 service = PhotoService(settings)
+MAX_GUEST_SELFIE_BYTES = 8 * 1024 * 1024
 
 app = FastAPI(
     title="FrameBucket Data Service",
@@ -176,16 +177,76 @@ async def upload_photo(
                 customer_id,
                 folder_id,
             )
+            payload = result.as_dict()
+            if result.media_type == "image":
+                try:
+                    payload["matched_guest_ids"] = await run_in_threadpool(
+                        service.match_uploaded_photo_faces,
+                        event_id,
+                        result.photo_id,
+                        customer_id,
+                    )
+                except Exception:
+                    logging.getLogger(__name__).exception(
+                        "Face matching failed for photo %s; upload remains available in the gallery.",
+                        result.photo_id,
+                    )
+                    payload["matched_guest_ids"] = []
+            else:
+                payload["matched_guest_ids"] = []
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except Exception as exc:
             logging.getLogger(__name__).exception("Upload processing failed.")
             raise HTTPException(status_code=422, detail=f"Could not process media: {exc}") from exc
-        return result.as_dict()
+        return payload
     finally:
         if temporary_path:
             temporary_path.unlink(missing_ok=True)
         await file.close()
+
+
+@app.post("/api/v1/events/{event_id}/guests/{guest_id}/face", dependencies=[Depends(require_service_key)])
+async def register_guest_face(
+    event_id: str,
+    guest_id: str,
+    file: UploadFile = File(...),
+    customer_id: str = Query(min_length=1, max_length=128),
+) -> dict:
+    try:
+        content = await file.read(MAX_GUEST_SELFIE_BYTES + 1)
+        if not content:
+            raise HTTPException(status_code=400, detail="Choose a selfie image.")
+        if len(content) > MAX_GUEST_SELFIE_BYTES:
+            raise HTTPException(status_code=413, detail="Selfies must be 8 MB or smaller.")
+        try:
+            return await run_in_threadpool(
+                service.register_guest_face,
+                event_id,
+                guest_id,
+                customer_id,
+                content,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:
+            logging.getLogger(__name__).exception("Guest face registration failed for event %s.", event_id)
+            raise HTTPException(status_code=503, detail=f"Face matching is temporarily unavailable: {exc}") from exc
+    finally:
+        await file.close()
+
+
+@app.delete("/api/v1/events/{event_id}/guests/{guest_id}/face", dependencies=[Depends(require_service_key)])
+def delete_guest_face(
+    event_id: str,
+    guest_id: str,
+    customer_id: str = Query(min_length=1, max_length=128),
+) -> dict:
+    try:
+        service.delete_guest_face(event_id, guest_id, customer_id)
+        return {"status": "deleted"}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.get(
@@ -220,6 +281,26 @@ def download_customer_gallery(event_id: str, payload: GalleryDownloadRequest) ->
             BackgroundTask(lambda: download_path.unlink(missing_ok=True))
             if remove_after_send else None
         ),
+    )
+
+
+@app.get(
+    "/api/v1/events/{event_id}/photos/{photo_id}/whatsapp-preview",
+    dependencies=[Depends(require_service_key)],
+)
+def get_whatsapp_preview(
+    event_id: str,
+    photo_id: str,
+    customer_id: str = Query(min_length=1, max_length=128),
+) -> Response:
+    try:
+        image = service.whatsapp_preview_bytes(event_id, photo_id, customer_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return Response(
+        content=image,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "private, no-store"},
     )
 
 
