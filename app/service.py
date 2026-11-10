@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
+import mimetypes
+import os
 import secrets
 import shutil
-
+import tempfile
 import uuid
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -110,6 +112,148 @@ class PhotoService:
                 (self.settings.event_root / event_id / kind / folder["folder_id"]).mkdir(parents=True, exist_ok=True)
             (self.settings.private_root / photographer_id / event_id / "originals" / folder["folder_id"]).mkdir(parents=True, exist_ok=True)
             return folder
+
+    def _album_selection_path(self, event_id: str, customer_id: str) -> Path:
+        validate_id(event_id, "event_id")
+        validate_id(customer_id, "customer_id")
+        return self.settings.temp_root / "album-selections" / event_id / f"{customer_id}.json"
+
+    def album_selection(self, event_id: str, photographer_id: str, customer_id: str) -> dict:
+        self._owned_event(event_id, photographer_id, customer_id)
+        selection_path = self._album_selection_path(event_id, customer_id)
+        if not selection_path.is_file():
+            return {"photo_ids": []}
+        try:
+            saved = json.loads(selection_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {"photo_ids": []}
+        available = {
+            photo["photo_id"]
+            for photo in self.list_gallery(event_id, customer_id)
+            if photo.get("media_type", "image") == "image"
+        }
+        return {"photo_ids": [photo_id for photo_id in saved.get("photo_ids", []) if photo_id in available]}
+
+    def save_album_selection(
+        self,
+        event_id: str,
+        photographer_id: str,
+        customer_id: str,
+        photo_ids: list[str],
+    ) -> dict:
+        self._owned_event(event_id, photographer_id, customer_id)
+        unique_photo_ids = list(dict.fromkeys(photo_ids))
+        if len(unique_photo_ids) > 5000:
+            raise ValueError("A selection can contain at most 5000 photos.")
+
+        with self.storage.lock_for_event(event_id):
+            manifest = self.storage.read_manifest(event_id)
+            photos_by_id = {photo["photo_id"]: photo for photo in manifest["photos"]}
+            for photo_id in unique_photo_ids:
+                photo = photos_by_id.get(photo_id)
+                if not photo or photo.get("status") != "READY":
+                    raise ValueError(f"Photo {photo_id} is not available for selection.")
+                if photo.get("media_type", "image") != "image":
+                    raise ValueError("Videos cannot be selected for album design.")
+                if photo.get("customer_id") != customer_id or photo.get("photographer_id") != photographer_id:
+                    raise ValueError(f"Photo {photo_id} belongs to another customer.")
+
+            selection_path = self._album_selection_path(event_id, customer_id)
+            if not unique_photo_ids:
+                selection_path.unlink(missing_ok=True)
+                return {"photo_ids": [], "photo_count": 0}
+
+            selection_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = selection_path.with_name(selection_path.name + ".tmp")
+            temporary.write_text(
+                json.dumps({
+                    "event_id": event_id,
+                    "customer_id": customer_id,
+                    "photo_ids": unique_photo_ids,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }, indent=2),
+                encoding="utf-8",
+            )
+            temporary.replace(selection_path)
+            return {"photo_ids": unique_photo_ids, "photo_count": len(unique_photo_ids)}
+
+    def download_gallery(
+        self,
+        event_id: str,
+        customer_id: str,
+        photo_ids: list[str] | None = None,
+    ) -> tuple[Path, str, str, bool]:
+        available = self.list_gallery(event_id, customer_id)
+        if photo_ids:
+            requested_ids = list(dict.fromkeys(photo_ids))
+            available_by_id = {photo["photo_id"]: photo for photo in available}
+            missing = [photo_id for photo_id in requested_ids if photo_id not in available_by_id]
+            if missing:
+                raise ValueError("One or more selected photos are not available for download.")
+            selected = [available_by_id[photo_id] for photo_id in requested_ids]
+        else:
+            selected = available
+        if not selected:
+            raise ValueError("There are no gallery photos available to download.")
+
+        event_file = self.settings.metadata_root / event_id / "event.json"
+        event = json.loads(event_file.read_text(encoding="utf-8"))
+        manifest_photos = {
+            photo["photo_id"]: photo
+            for photo in self.storage.read_manifest(event_id)["photos"]
+        }
+        folder_names = {
+            folder["folder_id"]: folder["name"]
+            for folder in self.storage.read_folders(event_id)
+        }
+        event_root = self.settings.event_root.resolve()
+
+        downloadable: list[tuple[dict, Path]] = []
+        for photo in selected:
+            manifest_photo = manifest_photos.get(photo["photo_id"])
+            if (
+                not manifest_photo
+                or manifest_photo.get("customer_id") != customer_id
+                or manifest_photo.get("status") not in {"READY", "SUBMITTED_FOR_ALBUM"}
+            ):
+                raise ValueError("One or more selected photos are not available for download.")
+            path = (self.settings.data_root / manifest_photo["processed_key"]).resolve()
+            if not path.is_relative_to(event_root) or not path.is_file():
+                raise ValueError("A processed gallery photo is unavailable for download.")
+            downloadable.append((photo, path))
+
+        if len(downloadable) == 1:
+            photo, path = downloadable[0]
+            original_name = Path(photo["original_filename"])
+            filename = safe_filename(
+                f"{photo['photo_number']:05d}_{original_name.stem}{path.suffix or '.jpg'}"
+            )
+            media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            return path, filename, media_type, False
+
+        self.settings.temp_root.mkdir(parents=True, exist_ok=True)
+        file_descriptor, archive_name = tempfile.mkstemp(
+            prefix="customer-gallery-", suffix=".zip", dir=self.settings.temp_root
+        )
+        archive_path = Path(archive_name)
+        try:
+            with os.fdopen(file_descriptor, "wb") as archive_file:
+                with zipfile.ZipFile(
+                    archive_file, "w", compression=zipfile.ZIP_STORED, allowZip64=True
+                ) as archive:
+                    for photo, path in downloadable:
+                        folder_name = safe_filename(folder_names.get(photo.get("folder_id", "root"), "Gallery"))
+                        original_name = Path(photo["original_filename"])
+                        suffix = path.suffix or ".jpg"
+                        entry_name = safe_filename(
+                            f"{photo['photo_number']:05d}_{original_name.stem}{suffix}"
+                        )
+                        archive.write(path, f"{folder_name}/{entry_name}")
+            event_code = safe_filename(event.get("event_code", event_id))
+            return archive_path, f"FrameBucket-{event_code}-gallery.zip", "application/zip", True
+        except Exception:
+            archive_path.unlink(missing_ok=True)
+            raise
 
     def _owned_event(self, event_id: str, photographer_id: str, customer_id: str) -> dict:
         event_id = validate_id(event_id, "event_id")
@@ -396,6 +540,7 @@ class PhotoService:
                     photo["album_submission_id"] = submission_id
                     photo["status"] = "SUBMITTED_FOR_ALBUM"
                 self.storage.write_manifest(event_id, manifest)
+                self._album_selection_path(event_id, customer_id).unlink(missing_ok=True)
             except Exception:
                 for _, source, destination in reversed(moved):
                     if destination.exists():

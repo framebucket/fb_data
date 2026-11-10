@@ -71,6 +71,9 @@ Send the X-FrameBucket-Service-Key header from the trusted Spring Boot backend. 
 - GET/POST /api/v1/events/{event_id}/folders — list or create folders (requires photographer_id and customer_id query parameters).
 - POST /api/v1/events/{event_id}/photos?photographer_id=...&customer_id=...&folder_id=... — multipart field `file`; accepts supported images and videos.
 - GET /api/v1/events/{event_id}/photos?customer_id=...&folder_id=... — list customer-visible previews.
+- GET /api/v1/events/{event_id}/album-selection — load the customer's temporary album selection.
+- PUT /api/v1/events/{event_id}/album-selection — save selected photo IDs to the temporary selection store.
+- POST /api/v1/events/{event_id}/downloads — JSON `{"customer_id":"...","photo_ids":[]}` returns one customer-visible item directly, or multiple/all items as a ZIP; pass photo IDs to download only selected items.
 - GET /api/v1/events/{event_id}/photos/{photo_id}/preview?customer_id=... — fetch an event preview.
 - GET /api/v1/events/{event_id}/photos/{photo_id}/original?photographer_id=...&customer_id=... — photographer-only original.
 - POST /api/v1/events/{event_id}/album-submissions — JSON: {"photographer_id":"...","customer_id":"...","photo_ids":["..."]}.
@@ -94,7 +97,7 @@ data_output/
   events/<event>/videos/<folder>/         # customer-visible video copies
   album_design/<event>/<submission>/       # selected originals and ZIP
   metadata/events/<event>/                # event, folder, and media manifests
-  tmp/                                    # temporary API uploads
+  tmp/                                    # temporary uploads, customer ZIPs, and album-selection drafts
 ~~~
 
 The filesystem adapter is for development only. The private photographer path is never returned by the customer gallery API. See INFRASTRUCTURE.md for the production design.

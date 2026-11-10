@@ -11,6 +11,7 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
 from .config import Settings
@@ -44,6 +45,17 @@ class AlbumSubmissionCreate(BaseModel):
     photographer_id: str = Field(min_length=1, max_length=128)
     customer_id: str = Field(min_length=1, max_length=128)
     photo_ids: list[str] = Field(min_length=1, max_length=5000)
+
+
+class AlbumSelectionUpdate(BaseModel):
+    photographer_id: str = Field(min_length=1, max_length=128)
+    customer_id: str = Field(min_length=1, max_length=128)
+    photo_ids: list[str] = Field(default_factory=list, max_length=5000)
+
+
+class GalleryDownloadRequest(BaseModel):
+    customer_id: str = Field(min_length=1, max_length=128)
+    photo_ids: list[str] = Field(default_factory=list, max_length=5000)
 
 
 def require_service_key(
@@ -84,6 +96,28 @@ def list_folders(
         return {"folders": service.list_folders(event_id, photographer_id, customer_id)}
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/events/{event_id}/album-selection", dependencies=[Depends(require_service_key)])
+def get_album_selection(
+    event_id: str,
+    photographer_id: str = Query(min_length=1, max_length=128),
+    customer_id: str = Query(min_length=1, max_length=128),
+) -> dict:
+    try:
+        return service.album_selection(event_id, photographer_id, customer_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.put("/api/v1/events/{event_id}/album-selection", dependencies=[Depends(require_service_key)])
+def save_album_selection(event_id: str, payload: AlbumSelectionUpdate) -> dict:
+    try:
+        return service.save_album_selection(
+            event_id, payload.photographer_id, payload.customer_id, payload.photo_ids
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.post("/api/v1/events/{event_id}/folders", dependencies=[Depends(require_service_key)])
@@ -167,6 +201,26 @@ def list_event_photos(
         return {"photos": service.list_gallery(event_id, customer_id, folder_id)}
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/events/{event_id}/downloads", dependencies=[Depends(require_service_key)])
+def download_customer_gallery(event_id: str, payload: GalleryDownloadRequest) -> FileResponse:
+    try:
+        download_path, filename, media_type, remove_after_send = service.download_gallery(
+            event_id, payload.customer_id, payload.photo_ids
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return FileResponse(
+        download_path,
+        media_type=media_type,
+        filename=filename,
+        headers={"Cache-Control": "private, no-store"},
+        background=(
+            BackgroundTask(lambda: download_path.unlink(missing_ok=True))
+            if remove_after_send else None
+        ),
+    )
 
 
 @app.get(
