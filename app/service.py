@@ -488,7 +488,8 @@ class PhotoService:
             }
             for photo_id in unique_photo_ids:
                 row = rows.get(photo_id)
-                if not row or row["status"] != "READY":
+                # Photos sent in an earlier album submission can be chosen again.
+                if not row or row["status"] not in VISIBLE_STATUSES:
                     raise ValueError(f"Photo {photo_id} is not available for selection.")
                 if row["media_type"] != "image":
                     raise ValueError("Videos cannot be selected for album design.")
@@ -525,7 +526,7 @@ class PhotoService:
                 row = rows.get(photo_id)
                 if not row:
                     raise ValueError(f"Photo {photo_id} does not belong to this event.")
-                if row["status"] != "READY":
+                if row["status"] not in VISIBLE_STATUSES:
                     raise ValueError(f"Photo {photo_id} is not ready for album design.")
                 if row["media_type"] != "image":
                     raise ValueError("Videos cannot be submitted for album design.")
