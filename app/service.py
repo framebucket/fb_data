@@ -1,57 +1,56 @@
 from __future__ import annotations
 
-import json
+import hashlib
 import logging
 import mimetypes
 import os
 import secrets
-import shutil
 import tempfile
 import uuid
 import zipfile
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 
 from PIL import Image, ImageOps
+from psycopg import Connection
+from psycopg.errors import UniqueViolation
+from psycopg.types.json import Jsonb
 
+from . import jobs
 from .config import Settings
+from .db import Database
 from .face_matching import MAX_IMAGE_PIXELS, EventFaceMatcher
 from .imaging import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, ImageProcessor
 from .storage import StorageBackend, create_storage, normalize_key, safe_filename, validate_id
 
 logger = logging.getLogger(__name__)
 
+VISIBLE_STATUSES = ("READY", "SUBMITTED_FOR_ALBUM")
+PENDING_STATUSES = ("QUEUED", "PROCESSING", "PROCESSING_FAILED")
+ROOT_FOLDER = {"folder_id": "root", "name": "Gallery"}
+ALBUM_LINK_DAYS = 30
+
+
+class AlbumNotReady(Exception):
+    """The album-design archive is still being built by a worker."""
+
+
+class PermanentJobError(Exception):
+    """A job failure that retrying cannot fix."""
+
 
 @dataclass(frozen=True)
-class PhotoResult:
-    photo_id: str
-    photo_number: int
-    event_id: str
-    photographer_id: str
-    customer_id: str
-    original_filename: str
-    original_key: str
-    processed_key: str
-    status: str
-    media_type: str
-    folder_id: str
-    width: int | None = None
-    height: int | None = None
-    processed_bytes: int | None = None
-    watermarked: bool = False
-    ai_enhanced: bool = False
-
-    def as_dict(self) -> dict:
-        return asdict(self)
+class DirectDownload:
+    url: str
 
 
 class PhotoService:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, database: Database | None = None) -> None:
         self.settings = settings
         self.storage: StorageBackend = create_storage(settings)
+        self.db = database or Database(settings.database_url, settings.db_pool_size)
         settings.temp_root.mkdir(parents=True, exist_ok=True)
         self.processor = ImageProcessor(
             logo_path=settings.logo_path,
@@ -60,127 +59,664 @@ class PhotoService:
         )
         self.face_matcher = EventFaceMatcher(settings)
 
-    def register_guest_face(
+    # ------------------------------------------------------------------ events and folders
+
+    def create_event(self, event_id: str, photographer_id: str, customer_id: str, event_code: str | None = None) -> dict:
+        event_id = validate_id(event_id, "event_id")
+        photographer_id = validate_id(photographer_id, "photographer_id")
+        customer_id = validate_id(customer_id, "customer_id")
+        with self.db.transaction() as connection:
+            connection.execute(
+                "INSERT INTO fb_data.event (event_id, event_code, photographer_id, customer_id) "
+                "VALUES (%s, %s, %s, %s) ON CONFLICT (event_id) DO NOTHING",
+                (event_id, event_code or event_id, photographer_id, customer_id),
+            )
+            event = self._event(connection, event_id)
+            if event["photographer_id"] != photographer_id or event["customer_id"] != customer_id:
+                raise ValueError("This event ID is already assigned to other users.")
+            if event_code and event["event_code"] != event_code:
+                connection.execute(
+                    "UPDATE fb_data.event SET event_code = %s WHERE event_id = %s", (event_code, event_id)
+                )
+                event["event_code"] = event_code
+            connection.execute(
+                "INSERT INTO fb_data.folder (event_id, folder_id, name) VALUES (%s, 'root', 'Gallery') "
+                "ON CONFLICT DO NOTHING",
+                (event_id,),
+            )
+        return self._event_dict(event)
+
+    def list_folders(self, event_id: str, photographer_id: str, customer_id: str) -> list[dict]:
+        with self.db.transaction() as connection:
+            event = self._owned_event(connection, event_id, photographer_id, customer_id)
+            return self._folders(connection, event["event_id"])
+
+    def create_folder(self, event_id: str, photographer_id: str, customer_id: str, name: str) -> dict:
+        cleaned_name = " ".join(name.split()).strip()
+        if not cleaned_name or len(cleaned_name) > 80:
+            raise ValueError("Folder name must contain between 1 and 80 characters.")
+        folder = {"folder_id": uuid.uuid4().hex, "name": cleaned_name}
+        try:
+            with self.db.transaction() as connection:
+                event = self._owned_event(connection, event_id, photographer_id, customer_id)
+                if cleaned_name.casefold() == ROOT_FOLDER["name"].casefold():
+                    raise ValueError("A folder with this name already exists.")
+                connection.execute(
+                    "INSERT INTO fb_data.folder (event_id, folder_id, name) VALUES (%s, %s, %s)",
+                    (event["event_id"], folder["folder_id"], cleaned_name),
+                )
+        except UniqueViolation as exc:
+            raise ValueError("A folder with this name already exists.") from exc
+        return folder
+
+    # ------------------------------------------------------------------ uploads
+
+    def init_upload(
         self,
         event_id: str,
-        guest_id: str,
+        photographer_id: str,
         customer_id: str,
-        selfie_bytes: bytes,
+        folder_id: str,
+        filename: str,
+        size_bytes: int,
+        content_type: str | None = None,
     ) -> dict:
+        """Register an upload and return where the client should send the file bytes."""
+        folder_id = validate_id(folder_id or "root", "folder_id")
+        original_filename = safe_filename(filename)
+        extension = Path(original_filename).suffix.lower()
+        if extension not in IMAGE_EXTENSIONS and extension not in VIDEO_EXTENSIONS:
+            raise ValueError(f"Unsupported image or video type: {extension or 'unknown'}")
+        if size_bytes <= 0:
+            raise ValueError("Uploaded file is empty.")
+        if size_bytes > self.settings.max_upload_bytes:
+            raise ValueError("File exceeds the upload limit.")
+        media_type = "video" if extension in VIDEO_EXTENSIONS else "image"
+        content_type = _clean_content_type(content_type) or (
+            mimetypes.guess_type(original_filename)[0] or "application/octet-stream"
+        )
+        photo_id = uuid.uuid4().hex
+
+        with self.db.transaction() as connection:
+            event = self._owned_event(connection, event_id, photographer_id, customer_id)
+            if not connection.execute(
+                "SELECT 1 FROM fb_data.folder WHERE event_id = %s AND folder_id = %s",
+                (event["event_id"], folder_id),
+            ).fetchone():
+                raise ValueError("Folder not found for this event.")
+            original_key = self.storage.original_key(
+                event["photographer_id"], event["event_id"], photo_id, original_filename, folder_id
+            )
+            processed_key = self.storage.processed_key(event["event_id"], photo_id, folder_id, original_filename)
+            connection.execute(
+                """
+                INSERT INTO fb_data.media (photo_id, event_id, folder_id, media_type, original_filename,
+                    content_type, original_key, processed_key, status, size_bytes)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'UPLOADING', %s)
+                """,
+                (photo_id, event["event_id"], folder_id, media_type, original_filename, content_type,
+                 original_key, processed_key, size_bytes),
+            )
+
+        upload_url = None
+        if self.settings.direct_uploads:
+            upload_url = self.storage.presign_put(
+                original_key, content_type, self.settings.upload_url_ttl_seconds
+            )
+        return {
+            "photo_id": photo_id,
+            "media_type": media_type,
+            "original_filename": original_filename,
+            "upload_method": "PUT",
+            "upload_url": upload_url,
+            "upload_headers": {"Content-Type": content_type} if upload_url else {},
+            "expires_in": self.settings.upload_url_ttl_seconds if upload_url else None,
+        }
+
+    def receive_upload_content(
+        self, event_id: str, photo_id: str, photographer_id: str, customer_id: str, source: Path
+    ) -> None:
+        """Store bytes sent through the service when the backend cannot issue direct upload URLs."""
+        with self.db.transaction() as connection:
+            self._owned_event(connection, event_id, photographer_id, customer_id)
+            media = self._media(connection, event_id, photo_id)
+            if media["status"] != "UPLOADING":
+                raise ValueError("This upload has already been completed.")
+        self.storage.upload_file(media["original_key"], source)
+
+    def complete_upload(self, event_id: str, photo_id: str, photographer_id: str, customer_id: str) -> dict:
+        """Verify the original arrived, number it, and queue processing. Safe to call twice."""
+        with self.db.transaction() as connection:
+            self._owned_event(connection, event_id, photographer_id, customer_id)
+            media = self._media(connection, event_id, photo_id)
+        if media["status"] != "UPLOADING":
+            return self._media_dict(media)
+
+        actual_size = self.storage.object_size(media["original_key"])
+        if not actual_size:
+            raise ValueError("The uploaded file was not received. Upload it again.")
+        if actual_size > self.settings.max_upload_bytes:
+            self.storage.delete(media["original_key"])
+            with self.db.transaction() as connection:
+                connection.execute("DELETE FROM fb_data.media WHERE photo_id = %s", (photo_id,))
+            raise ValueError("File exceeds the upload limit.")
+
+        with self.db.transaction() as connection:
+            locked = connection.execute(
+                "SELECT status FROM fb_data.media WHERE photo_id = %s FOR UPDATE", (photo_id,)
+            ).fetchone()
+            if locked and locked["status"] == "UPLOADING":
+                number = connection.execute(
+                    "UPDATE fb_data.event SET next_photo_number = next_photo_number + 1 "
+                    "WHERE event_id = %s RETURNING next_photo_number - 1 AS photo_number",
+                    (event_id,),
+                ).fetchone()["photo_number"]
+                connection.execute(
+                    "UPDATE fb_data.media SET status = 'QUEUED', photo_number = %s, size_bytes = %s, "
+                    "updated_at = now() WHERE photo_id = %s",
+                    (number, actual_size, photo_id),
+                )
+                jobs.enqueue(connection, jobs.PROCESS_MEDIA, {"photo_id": photo_id},
+                             self.settings.job_max_attempts)
+            media = self._media(connection, event_id, photo_id)
+        return self._media_dict(media)
+
+    def ingest_file(
+        self,
+        source: Path,
+        original_filename: str,
+        event_id: str,
+        photographer_id: str,
+        customer_id: str,
+        folder_id: str = "root",
+    ) -> dict:
+        """Server-side upload (legacy multipart endpoint and CLI): store the original, then queue it."""
+        grant = self.init_upload(
+            event_id, photographer_id, customer_id, folder_id, original_filename, source.stat().st_size
+        )
+        with self.db.transaction() as connection:
+            media = self._media(connection, event_id, grant["photo_id"])
+        self.storage.upload_file(media["original_key"], source)
+        return self.complete_upload(event_id, grant["photo_id"], photographer_id, customer_id)
+
+    # ------------------------------------------------------------------ worker jobs
+
+    def run_job(self, kind: str, payload: dict) -> None:
+        if kind == jobs.PROCESS_MEDIA:
+            self.process_media(payload["photo_id"])
+        elif kind == jobs.SCAN_FACES:
+            self.scan_faces(payload["photo_id"])
+        elif kind == jobs.BUILD_ALBUM:
+            self.build_album(payload["submission_id"])
+        else:
+            raise PermanentJobError(f"Unknown job kind: {kind}")
+
+    def job_failed(self, kind: str, payload: dict, error: str) -> None:
+        """Called once a job has exhausted its retries."""
+        with self.db.transaction() as connection:
+            if kind == jobs.PROCESS_MEDIA:
+                connection.execute(
+                    "UPDATE fb_data.media SET status = 'PROCESSING_FAILED', error = %s, updated_at = now() "
+                    "WHERE photo_id = %s AND status IN ('QUEUED', 'PROCESSING')",
+                    (error[:500], payload.get("photo_id")),
+                )
+            elif kind == jobs.BUILD_ALBUM:
+                row = connection.execute(
+                    "UPDATE fb_data.album_submission SET status = 'FAILED', error = %s "
+                    "WHERE submission_id = %s RETURNING event_id",
+                    (error[:500], payload.get("submission_id")),
+                ).fetchone()
+                if row:
+                    jobs.publish(connection, jobs.OUTBOX_ALBUM_FAILED, row["event_id"],
+                                 {"submission_id": payload.get("submission_id"), "error": error[:500]})
+
+    def process_media(self, photo_id: str) -> None:
+        photo_id = validate_id(photo_id, "photo_id")
+        with self.db.transaction() as connection:
+            media = connection.execute(
+                "UPDATE fb_data.media SET status = 'PROCESSING', updated_at = now() "
+                "WHERE photo_id = %s AND status IN ('QUEUED', 'PROCESSING') RETURNING *",
+                (photo_id,),
+            ).fetchone()
+        if not media:
+            logger.info("Skipping media %s; it is no longer waiting for processing.", photo_id)
+            return
+
+        if media["media_type"] == "video":
+            self.storage.copy(media["original_key"], media["processed_key"])
+            result = {"width": None, "height": None, "bytes": media["size_bytes"],
+                      "watermarked": False, "ai_enhanced": False}
+            embeddings = None
+        else:
+            source, source_cleanup = self.storage.materialize(
+                media["original_key"], suffix=Path(media["original_filename"]).suffix
+            )
+            with tempfile.NamedTemporaryFile(
+                prefix="processed-", suffix=".jpg", dir=self.settings.temp_root, delete=False
+            ) as temporary:
+                processed_path = Path(temporary.name)
+            try:
+                result = self.processor.process(source, processed_path)
+                self.storage.upload_file(media["processed_key"], processed_path)
+                embeddings = self._embeddings_or_none(processed_path)
+            finally:
+                processed_path.unlink(missing_ok=True)
+                if source_cleanup:
+                    source.unlink(missing_ok=True)
+
+        with self.db.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE fb_data.media
+                SET status = 'READY', width = %s, height = %s, processed_bytes = %s,
+                    watermarked = %s, ai_enhanced = %s, error = NULL, updated_at = now()
+                WHERE photo_id = %s
+                """,
+                (result["width"], result["height"], result["bytes"], bool(result["watermarked"]),
+                 bool(result["ai_enhanced"]), photo_id),
+            )
+            if embeddings is not None:
+                self._store_embeddings_and_match(connection, media, embeddings)
+
+    def scan_faces(self, photo_id: str) -> None:
+        """Compute face embeddings for an already processed photo (used for photos imported from JSON)."""
+        with self.db.transaction() as connection:
+            media = connection.execute(
+                "SELECT * FROM fb_data.media WHERE photo_id = %s", (photo_id,)
+            ).fetchone()
+        if (
+            not media or media["media_type"] != "image" or media["status"] not in VISIBLE_STATUSES
+            or media["face_embeddings"] is not None
+        ):
+            return
+        path, cleanup = self.storage.materialize(self._processed_key(media), suffix=".jpg")
+        try:
+            embeddings = self._embeddings_or_none(path)
+        finally:
+            if cleanup:
+                path.unlink(missing_ok=True)
+        if embeddings is None:
+            raise RuntimeError("Face models are unavailable; the scan will be retried.")
+        with self.db.transaction() as connection:
+            self._store_embeddings_and_match(connection, media, embeddings)
+
+    def _embeddings_or_none(self, processed_path: Path) -> list[list[float]] | None:
+        if not self.settings.face_matching_enabled:
+            return None
+        try:
+            return self.face_matcher.face_embeddings(processed_path.read_bytes())
+        except Exception:
+            logger.exception("Face scan failed for %s; the photo stays available in the gallery.", processed_path.name)
+            return None
+
+    def _store_embeddings_and_match(self, connection: Connection, media: dict, embeddings: list) -> None:
+        # Serialise with guest registration for the same event so a guest registering while this
+        # photo is processed is matched either here or by the registration, never by neither.
+        self._lock_event_faces(connection, media["event_id"])
+        connection.execute(
+            "UPDATE fb_data.media SET face_embeddings = %s WHERE photo_id = %s",
+            (Jsonb(embeddings), media["photo_id"]),
+        )
+        guests = {
+            row["guest_id"]: row["embedding"]
+            for row in connection.execute(
+                "SELECT guest_id, embedding FROM fb_data.face_guest WHERE event_id = %s", (media["event_id"],)
+            )
+        }
+        number = connection.execute(
+            "SELECT photo_number FROM fb_data.media WHERE photo_id = %s", (media["photo_id"],)
+        ).fetchone()["photo_number"]
+        for guest_id in self.face_matcher.matching_guest_embeddings(embeddings, guests):
+            jobs.publish(connection, jobs.OUTBOX_FACE_MATCH, media["event_id"], {
+                "guest_id": guest_id,
+                "photo_id": media["photo_id"],
+                "photo_number": number,
+            })
+
+    def cleanup_abandoned_uploads(self) -> int:
+        with self.db.transaction() as connection:
+            rows = connection.execute(
+                "DELETE FROM fb_data.media WHERE status = 'UPLOADING' "
+                "AND created_at < now() - make_interval(hours => %s) RETURNING original_key",
+                (self.settings.abandoned_upload_hours,),
+            ).fetchall()
+        for row in rows:
+            try:
+                self.storage.delete(row["original_key"])
+            except Exception:
+                logger.exception("Could not delete abandoned upload %s", row["original_key"])
+        return len(rows)
+
+    # ------------------------------------------------------------------ guest face matching
+
+    def register_guest_face(self, event_id: str, guest_id: str, customer_id: str, selfie_bytes: bytes) -> dict:
         event_id = validate_id(event_id, "event_id")
         guest_id = validate_id(guest_id, "guest_id")
         customer_id = validate_id(customer_id, "customer_id")
         if not self.settings.face_matching_enabled:
             raise ValueError("Event face matching is disabled on the Python data service.")
-        event = self._read_event(event_id)
-        if event.get("customer_id") != customer_id:
-            raise ValueError("The event does not belong to the supplied customer.")
+        with self.db.transaction() as connection:
+            event = self._event(connection, event_id)
+            if event["customer_id"] != customer_id:
+                raise ValueError("The event does not belong to the supplied customer.")
 
         embedding = self.face_matcher.selfie_embedding(selfie_bytes)
-        matching_photo_ids: list[str] = []
-        with self.storage.lock_for_event(event_id):
-            manifest = self.storage.read_manifest(event_id)
-            face_index = self.storage.read_json(
-                self.storage.face_index_key(event_id),
-                {"event_id": event_id, "guests": {}, "photos": {}},
+        with self.db.transaction() as connection:
+            self._lock_event_faces(connection, event_id)
+            connection.execute(
+                "INSERT INTO fb_data.face_guest (event_id, guest_id, embedding) VALUES (%s, %s, %s) "
+                "ON CONFLICT (event_id, guest_id) DO UPDATE SET embedding = EXCLUDED.embedding",
+                (event_id, guest_id, Jsonb(embedding)),
             )
-            guests = face_index.setdefault("guests", {})
-            photos = face_index.setdefault("photos", {})
-            for photo in manifest.get("photos", []):
-                if (
-                    photo.get("customer_id") != customer_id
-                    or photo.get("status") not in {"READY", "SUBMITTED_FOR_ALBUM"}
-                    or photo.get("media_type") == "video"
-                ):
-                    continue
-                key = self._validated_processed_key(event_id, photo)
-                photo_id = photo["photo_id"]
-                photo_embeddings = photos.get(photo_id)
-                if not isinstance(photo_embeddings, list):
-                    path, cleanup = self.storage.materialize(key, suffix=".jpg")
-                    try:
-                        photo_embeddings = self.face_matcher.face_embeddings(path.read_bytes())
-                    finally:
-                        if cleanup:
-                            path.unlink(missing_ok=True)
-                    photos[photo_id] = photo_embeddings
-                if guest_id in self.face_matcher.matching_guest_embeddings(
-                    photo_embeddings, {guest_id: embedding}
-                ):
-                    matching_photo_ids.append(photo_id)
-
-            guests[guest_id] = embedding
-            self.storage.write_json(self.storage.face_index_key(event_id), face_index)
-
-        return {"guest_id": guest_id, "matched_photo_ids": matching_photo_ids}
-
-    def match_uploaded_photo_faces(self, event_id: str, photo_id: str, customer_id: str) -> list[str]:
-        if not self.settings.face_matching_enabled:
-            return []
-        event_id = validate_id(event_id, "event_id")
-        photo_id = validate_id(photo_id, "photo_id")
-        customer_id = validate_id(customer_id, "customer_id")
-        event = self._read_event(event_id)
-        if event.get("customer_id") != customer_id:
-            raise ValueError("The event does not belong to the supplied customer.")
-        with self.storage.lock_for_event(event_id):
-            face_index = self.storage.read_json(
-                self.storage.face_index_key(event_id),
-                {"event_id": event_id, "guests": {}, "photos": {}},
-            )
-            guests = face_index.get("guests", {})
-            if not guests:
-                return []
-            manifest = self.storage.read_manifest(event_id)
-            photo = next((item for item in manifest.get("photos", []) if item.get("photo_id") == photo_id), None)
-            if (
-                not photo
-                or photo.get("customer_id") != customer_id
-                or photo.get("status") not in {"READY", "SUBMITTED_FOR_ALBUM"}
-                or photo.get("media_type") == "video"
+            matched: list[str] = []
+            unscanned: list[str] = []
+            for row in connection.execute(
+                "SELECT photo_id, face_embeddings FROM fb_data.media WHERE event_id = %s "
+                "AND media_type = 'image' AND status = ANY(%s) ORDER BY photo_number",
+                (event_id, list(VISIBLE_STATUSES)),
             ):
-                return []
-            path, cleanup = self.storage.materialize(self._validated_processed_key(event_id, photo), suffix=".jpg")
-            try:
-                photo_embeddings = self.face_matcher.face_embeddings(path.read_bytes())
-                face_index.setdefault("photos", {})[photo_id] = photo_embeddings
-                matched_guest_ids = self.face_matcher.matching_guest_embeddings(photo_embeddings, guests)
-                self.storage.write_json(self.storage.face_index_key(event_id), face_index)
-                return matched_guest_ids
-            finally:
-                if cleanup:
-                    path.unlink(missing_ok=True)
+                if row["face_embeddings"] is None:
+                    unscanned.append(row["photo_id"])
+                elif self.face_matcher.matching_guest_embeddings(row["face_embeddings"], {guest_id: embedding}):
+                    matched.append(row["photo_id"])
+            # Photos without stored embeddings are scanned by workers; matches arrive via the outbox.
+            for photo_id in unscanned:
+                jobs.enqueue(connection, jobs.SCAN_FACES, {"photo_id": photo_id}, self.settings.job_max_attempts)
+        return {"guest_id": guest_id, "matched_photo_ids": matched, "pending_scan_count": len(unscanned)}
 
     def delete_guest_face(self, event_id: str, guest_id: str, customer_id: str) -> None:
         event_id = validate_id(event_id, "event_id")
         guest_id = validate_id(guest_id, "guest_id")
         customer_id = validate_id(customer_id, "customer_id")
-        event = self._read_event(event_id)
-        if event.get("customer_id") != customer_id:
-            raise ValueError("The event does not belong to the supplied customer.")
-        with self.storage.lock_for_event(event_id):
-            key = self.storage.face_index_key(event_id)
-            face_index = self.storage.read_json(key, {"event_id": event_id, "guests": {}})
-            face_index.get("guests", {}).pop(guest_id, None)
-            self.storage.write_json(key, face_index)
+        with self.db.transaction() as connection:
+            event = self._event(connection, event_id)
+            if event["customer_id"] != customer_id:
+                raise ValueError("The event does not belong to the supplied customer.")
+            connection.execute(
+                "DELETE FROM fb_data.face_guest WHERE event_id = %s AND guest_id = %s", (event_id, guest_id)
+            )
+            connection.execute(
+                "DELETE FROM fb_data.outbox WHERE event_id = %s AND kind = %s AND delivered_at IS NULL "
+                "AND payload->>'guest_id' = %s",
+                (event_id, jobs.OUTBOX_FACE_MATCH, guest_id),
+            )
+
+    @staticmethod
+    def _lock_event_faces(connection: Connection, event_id: str) -> None:
+        connection.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", ("fb_data.faces:" + event_id,))
+
+    # ------------------------------------------------------------------ album selection and submission
+
+    def album_selection(self, event_id: str, photographer_id: str, customer_id: str) -> dict:
+        with self.db.transaction() as connection:
+            event = self._owned_event(connection, event_id, photographer_id, customer_id)
+            row = connection.execute(
+                "SELECT photo_ids FROM fb_data.album_selection WHERE event_id = %s AND customer_id = %s",
+                (event["event_id"], customer_id),
+            ).fetchone()
+            if not row:
+                return {"photo_ids": []}
+            available = {
+                item["photo_id"]
+                for item in connection.execute(
+                    "SELECT photo_id FROM fb_data.media WHERE event_id = %s AND media_type = 'image' "
+                    "AND status = ANY(%s)",
+                    (event["event_id"], list(VISIBLE_STATUSES)),
+                )
+            }
+        return {"photo_ids": [photo_id for photo_id in row["photo_ids"] if photo_id in available]}
+
+    def save_album_selection(self, event_id: str, photographer_id: str, customer_id: str, photo_ids: list[str]) -> dict:
+        unique_photo_ids = list(dict.fromkeys(photo_ids))
+        if len(unique_photo_ids) > 5000:
+            raise ValueError("A selection can contain at most 5000 photos.")
+        with self.db.transaction() as connection:
+            event = self._owned_event(connection, event_id, photographer_id, customer_id)
+            if not unique_photo_ids:
+                connection.execute(
+                    "DELETE FROM fb_data.album_selection WHERE event_id = %s AND customer_id = %s",
+                    (event["event_id"], customer_id),
+                )
+                return {"photo_ids": [], "photo_count": 0}
+            rows = {
+                row["photo_id"]: row
+                for row in connection.execute(
+                    "SELECT photo_id, status, media_type FROM fb_data.media "
+                    "WHERE event_id = %s AND photo_id = ANY(%s)",
+                    (event["event_id"], unique_photo_ids),
+                )
+            }
+            for photo_id in unique_photo_ids:
+                row = rows.get(photo_id)
+                if not row or row["status"] != "READY":
+                    raise ValueError(f"Photo {photo_id} is not available for selection.")
+                if row["media_type"] != "image":
+                    raise ValueError("Videos cannot be selected for album design.")
+            connection.execute(
+                """
+                INSERT INTO fb_data.album_selection (event_id, customer_id, photo_ids, updated_at)
+                VALUES (%s, %s, %s, now())
+                ON CONFLICT (event_id, customer_id)
+                DO UPDATE SET photo_ids = EXCLUDED.photo_ids, updated_at = now()
+                """,
+                (event["event_id"], customer_id, Jsonb(unique_photo_ids)),
+            )
+        return {"photo_ids": unique_photo_ids, "photo_count": len(unique_photo_ids)}
+
+    def submit_album(self, event_id: str, photographer_id: str, customer_id: str, photo_ids: list[str]) -> dict:
+        """Reserve the selection and return the album link now; a worker builds the ZIP."""
+        unique_photo_ids = list(dict.fromkeys(photo_ids))
+        if not unique_photo_ids:
+            raise ValueError("Select at least one photo for album design.")
+        submission_id = uuid.uuid4().hex
+        token = secrets.token_urlsafe(32)
+        expires_at = datetime.now(timezone.utc) + timedelta(days=ALBUM_LINK_DAYS)
+        with self.db.transaction() as connection:
+            event = self._owned_event(connection, event_id, photographer_id, customer_id)
+            rows = {
+                row["photo_id"]: row
+                for row in connection.execute(
+                    "SELECT * FROM fb_data.media WHERE event_id = %s AND photo_id = ANY(%s) FOR UPDATE",
+                    (event["event_id"], unique_photo_ids),
+                )
+            }
+            selected = []
+            for photo_id in unique_photo_ids:
+                row = rows.get(photo_id)
+                if not row:
+                    raise ValueError(f"Photo {photo_id} does not belong to this event.")
+                if row["status"] != "READY":
+                    raise ValueError(f"Photo {photo_id} is not ready for album design.")
+                if row["media_type"] != "image":
+                    raise ValueError("Videos cannot be submitted for album design.")
+                selected.append(row)
+            photo_numbers = [
+                {"photo_number": row["photo_number"], "original_filename": row["original_filename"],
+                 "folder_id": row["folder_id"]}
+                for row in selected
+            ]
+            connection.execute(
+                """
+                INSERT INTO fb_data.album_submission (submission_id, event_id, photographer_id, customer_id,
+                    token_hash, archive_key, status, photo_ids, photo_numbers, expires_at)
+                VALUES (%s, %s, %s, %s, %s, %s, 'PREPARING', %s, %s, %s)
+                """,
+                (submission_id, event["event_id"], photographer_id, customer_id, _token_hash(token),
+                 f"album_design/{event['event_id']}/{submission_id}/album-design.zip",
+                 Jsonb(unique_photo_ids), Jsonb(photo_numbers), expires_at),
+            )
+            connection.execute(
+                "UPDATE fb_data.media SET status = 'SUBMITTED_FOR_ALBUM', album_submission_id = %s, "
+                "updated_at = now() WHERE photo_id = ANY(%s)",
+                (submission_id, unique_photo_ids),
+            )
+            connection.execute(
+                "DELETE FROM fb_data.album_selection WHERE event_id = %s AND customer_id = %s",
+                (event["event_id"], customer_id),
+            )
+            jobs.enqueue(connection, jobs.BUILD_ALBUM, {"submission_id": submission_id},
+                         self.settings.job_max_attempts)
+        return {
+            "submission_id": submission_id,
+            "event_id": event_id,
+            "photo_count": len(selected),
+            "photo_numbers": photo_numbers,
+            "album_design_link": f"{self.settings.public_base_url}/api/v1/album-design/{token}",
+            "expires_at": expires_at.isoformat(),
+            "archive_status": "PREPARING",
+            "status": "SUBMITTED",
+        }
+
+    def build_album(self, submission_id: str) -> None:
+        with self.db.transaction() as connection:
+            submission = connection.execute(
+                "SELECT * FROM fb_data.album_submission WHERE submission_id = %s", (submission_id,)
+            ).fetchone()
+            if not submission or submission["status"] != "PREPARING":
+                return
+            media = {
+                row["photo_id"]: row
+                for row in connection.execute(
+                    "SELECT * FROM fb_data.media WHERE photo_id = ANY(%s)", (list(submission["photo_ids"]),)
+                )
+            }
+        missing = [photo_id for photo_id in submission["photo_ids"] if photo_id not in media]
+        if missing:
+            raise PermanentJobError("Some selected photos no longer exist.")
+
+        self.settings.temp_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            prefix="album-design-", suffix=".zip", dir=self.settings.temp_root, delete=False
+        ) as temporary:
+            archive_path = Path(temporary.name)
+        try:
+            # Stage one original at a time so peak temporary disk is the ZIP plus one source file.
+            with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+                for photo_id in submission["photo_ids"]:
+                    row = media[photo_id]
+                    source_key = self._original_key(row, submission["photographer_id"])
+                    try:
+                        source, cleanup = self.storage.materialize(
+                            source_key, suffix=Path(row["original_filename"]).suffix
+                        )
+                    except FileNotFoundError as exc:
+                        raise PermanentJobError(f"Original for photo {row['photo_number']} is missing.") from exc
+                    try:
+                        archive.write(
+                            source, arcname=safe_filename(f"{row['photo_number']:05d}_{row['original_filename']}")
+                        )
+                    finally:
+                        if cleanup:
+                            source.unlink(missing_ok=True)
+            self.storage.upload_file(submission["archive_key"], archive_path)
+        finally:
+            archive_path.unlink(missing_ok=True)
+
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE fb_data.album_submission SET status = 'READY', ready_at = now(), error = NULL "
+                "WHERE submission_id = %s",
+                (submission_id,),
+            )
+            jobs.publish(connection, jobs.OUTBOX_ALBUM_READY, submission["event_id"], {
+                "submission_id": submission_id,
+                "photo_count": len(submission["photo_ids"]),
+                "expires_at": submission["expires_at"].isoformat(),
+            })
+
+    def resolve_album_link(self, token: str) -> tuple[Path | DirectDownload, str, bool]:
+        if not token or len(token) > 200:
+            raise FileNotFoundError("Album design link not found.")
+        with self.db.transaction() as connection:
+            submission = connection.execute(
+                "SELECT s.*, e.event_code FROM fb_data.album_submission s "
+                "JOIN fb_data.event e ON e.event_id = s.event_id WHERE s.token_hash = %s",
+                (_token_hash(token),),
+            ).fetchone()
+        if not submission:
+            raise FileNotFoundError("Album design link not found.")
+        if submission["expires_at"] <= datetime.now(timezone.utc):
+            raise FileNotFoundError("Album design link has expired.")
+        if submission["status"] == "PREPARING":
+            raise AlbumNotReady("The album photos are still being packaged. Try this link again in a few minutes.")
+        if submission["status"] != "READY":
+            raise FileNotFoundError("The album design archive could not be prepared. Ask the customer to contact you.")
+        archive_key = normalize_key(submission["archive_key"])
+        filename = f"FrameBucket-{safe_filename(submission['event_code'])}-album-design.zip"
+        url = self.storage.presign_get(
+            archive_key, self.settings.media_url_ttl_seconds, filename=filename, attachment=True,
+            content_type="application/zip",
+        )
+        if url:
+            return DirectDownload(url), filename, False
+        try:
+            archive, cleanup = self.storage.materialize(archive_key, suffix=".zip", prefix="fb-album-")
+        except (FileNotFoundError, OSError) as exc:
+            raise FileNotFoundError("Album design archive not found.") from exc
+        return archive, filename, cleanup
+
+    # ------------------------------------------------------------------ gallery reads
+
+    def list_gallery(
+        self, event_id: str, customer_id: str, folder_id: str | None = None, include_pending: bool = False
+    ) -> list[dict]:
+        statuses = list(VISIBLE_STATUSES) + (list(PENDING_STATUSES) if include_pending else [])
+        with self.db.transaction() as connection:
+            event = self._event(connection, validate_id(event_id, "event_id"))
+            if event["customer_id"] != validate_id(customer_id, "customer_id"):
+                raise ValueError("Customer does not have access to this event.")
+            query = (
+                "SELECT * FROM fb_data.media WHERE event_id = %s AND status = ANY(%s)"
+                + (" AND folder_id = %s" if folder_id is not None else "")
+                + " ORDER BY photo_number"
+            )
+            params = (event["event_id"], statuses) + ((folder_id,) if folder_id is not None else ())
+            return [self._media_dict(row) for row in connection.execute(query, params)]
+
+    def media_url(self, event_id: str, photo_id: str, customer_id: str) -> str | None:
+        media = self._visible_media(event_id, photo_id, customer_id)
+        return self.storage.presign_get(
+            self._processed_key(media),
+            self.settings.media_url_ttl_seconds,
+            content_type=mimetypes.guess_type(media["processed_key"])[0],
+        )
+
+    def media_path(self, event_id: str, photo_id: str, customer_id: str) -> tuple[Path, bool]:
+        media = self._visible_media(event_id, photo_id, customer_id)
+        try:
+            return self.storage.materialize(self._processed_key(media))
+        except (FileNotFoundError, OSError) as exc:
+            raise ValueError("Processed photo not found.") from exc
+
+    def preview_path(self, event_id: str, photo_id: str, customer_id: str) -> tuple[Path, bool]:
+        return self.media_path(event_id, photo_id, customer_id)
+
+    def original_url(self, event_id: str, photo_id: str, photographer_id: str, customer_id: str) -> str | None:
+        media = self._photographer_media(event_id, photo_id, photographer_id, customer_id)
+        return self.storage.presign_get(
+            self._original_key(media, photographer_id),
+            self.settings.media_url_ttl_seconds,
+            filename=media["original_filename"],
+            attachment=True,
+        )
+
+    def original_path_for_photographer(
+        self, event_id: str, photo_id: str, photographer_id: str, customer_id: str
+    ) -> tuple[Path, bool, str]:
+        media = self._photographer_media(event_id, photo_id, photographer_id, customer_id)
+        try:
+            path, cleanup = self.storage.materialize(
+                self._original_key(media, photographer_id), suffix=Path(media["original_filename"]).suffix
+            )
+        except (FileNotFoundError, OSError) as exc:
+            raise ValueError("Photographer original not found.") from exc
+        return path, cleanup, safe_filename(media["original_filename"])
 
     def whatsapp_preview_bytes(self, event_id: str, photo_id: str, customer_id: str) -> bytes:
-        event_id = validate_id(event_id, "event_id")
-        photo_id = validate_id(photo_id, "photo_id")
-        customer_id = validate_id(customer_id, "customer_id")
-        event = self._read_event(event_id)
-        if event.get("customer_id") != customer_id:
-            raise ValueError("The event does not belong to the supplied customer.")
-        manifest = self.storage.read_manifest(event_id)
-        photo = next((item for item in manifest.get("photos", []) if item.get("photo_id") == photo_id), None)
-        if (
-            not photo
-            or photo.get("customer_id") != customer_id
-            or photo.get("status") not in {"READY", "SUBMITTED_FOR_ALBUM"}
-            or photo.get("media_type") == "video"
-        ):
+        media = self._visible_media(event_id, photo_id, customer_id)
+        if media["media_type"] == "video":
             raise ValueError("The requested event photo is not available.")
-        path, cleanup = self.storage.materialize(self._validated_processed_key(event_id, photo), suffix=".jpg")
+        path, cleanup = self.storage.materialize(self._processed_key(media), suffix=".jpg")
         try:
             max_bytes = 4_800_000
             if path.stat().st_size <= max_bytes:
@@ -208,122 +744,14 @@ class PhotoService:
             if cleanup:
                 path.unlink(missing_ok=True)
 
-    def create_event(self, event_id: str, photographer_id: str, customer_id: str, event_code: str | None = None) -> dict:
-        event_id = validate_id(event_id, "event_id")
-        photographer_id = validate_id(photographer_id, "photographer_id")
-        customer_id = validate_id(customer_id, "customer_id")
-        self.storage.prepare_event(photographer_id, event_id)
-
-        event_key = self.storage.event_key(event_id)
-        with self.storage.lock_for_event(event_id):
-            if self.storage.exists(event_key):
-                existing = self.storage.read_json(event_key)
-                if (
-                    existing.get("photographer_id") != photographer_id
-                    or existing.get("customer_id") != customer_id
-                ):
-                    raise ValueError("This event ID is already assigned to other users.")
-                return existing
-
-            event = {
-                "event_id": event_id,
-                "event_code": event_code or event_id,
-                "photographer_id": photographer_id,
-                "customer_id": customer_id,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "customer_gallery_key": f"events/{event_id}",
-                "photographer_originals_key": f"photographer/{photographer_id}/{event_id}/originals",
-            }
-            self.storage.write_json(event_key, event)
-            self.storage.write_manifest(event_id, {"event_id": event_id, "photos": []})
-            return event
-
-    def list_folders(self, event_id: str, photographer_id: str, customer_id: str) -> list[dict]:
-        event = self._owned_event(event_id, photographer_id, customer_id)
-        return self.storage.read_folders(event["event_id"])
-
-    def create_folder(self, event_id: str, photographer_id: str, customer_id: str, name: str) -> dict:
-        event = self._owned_event(event_id, photographer_id, customer_id)
-        cleaned_name = " ".join(name.split()).strip()
-        if not cleaned_name or len(cleaned_name) > 80:
-            raise ValueError("Folder name must contain between 1 and 80 characters.")
-        with self.storage.lock_for_event(event["event_id"]):
-            folders = self.storage.read_folders(event["event_id"])
-            if any(folder["name"].casefold() == cleaned_name.casefold() for folder in folders):
-                raise ValueError("A folder with this name already exists.")
-            folder = {"folder_id": uuid.uuid4().hex, "name": cleaned_name}
-            folders.append(folder)
-            self.storage.write_folders(event["event_id"], folders)
-            return folder
-
-    def _album_selection_key(self, event_id: str, customer_id: str) -> str:
-        return self.storage.album_selection_key(event_id, customer_id)
-
-    def album_selection(self, event_id: str, photographer_id: str, customer_id: str) -> dict:
-        self._owned_event(event_id, photographer_id, customer_id)
-        selection_key = self._album_selection_key(event_id, customer_id)
-        if not self.storage.exists(selection_key):
-            return {"photo_ids": []}
-        try:
-            saved = self.storage.read_json(selection_key)
-        except (OSError, ValueError, json.JSONDecodeError):
-            return {"photo_ids": []}
-        available = {
-            photo["photo_id"]
-            for photo in self.list_gallery(event_id, customer_id)
-            if photo.get("media_type", "image") == "image"
-        }
-        return {"photo_ids": [photo_id for photo_id in saved.get("photo_ids", []) if photo_id in available]}
-
-    def save_album_selection(
-        self,
-        event_id: str,
-        photographer_id: str,
-        customer_id: str,
-        photo_ids: list[str],
-    ) -> dict:
-        self._owned_event(event_id, photographer_id, customer_id)
-        unique_photo_ids = list(dict.fromkeys(photo_ids))
-        if len(unique_photo_ids) > 5000:
-            raise ValueError("A selection can contain at most 5000 photos.")
-
-        with self.storage.lock_for_event(event_id):
-            manifest = self.storage.read_manifest(event_id)
-            photos_by_id = {photo["photo_id"]: photo for photo in manifest["photos"]}
-            for photo_id in unique_photo_ids:
-                photo = photos_by_id.get(photo_id)
-                if not photo or photo.get("status") != "READY":
-                    raise ValueError(f"Photo {photo_id} is not available for selection.")
-                if photo.get("media_type", "image") != "image":
-                    raise ValueError("Videos cannot be selected for album design.")
-                if photo.get("customer_id") != customer_id or photo.get("photographer_id") != photographer_id:
-                    raise ValueError(f"Photo {photo_id} belongs to another customer.")
-
-            selection_key = self._album_selection_key(event_id, customer_id)
-            if not unique_photo_ids:
-                self.storage.delete(selection_key)
-                return {"photo_ids": [], "photo_count": 0}
-
-            self.storage.write_json(selection_key, {
-                    "event_id": event_id,
-                    "customer_id": customer_id,
-                    "photo_ids": unique_photo_ids,
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                })
-            return {"photo_ids": unique_photo_ids, "photo_count": len(unique_photo_ids)}
-
     def download_gallery(
-        self,
-        event_id: str,
-        customer_id: str,
-        photo_ids: list[str] | None = None,
+        self, event_id: str, customer_id: str, photo_ids: list[str] | None = None
     ) -> tuple[Path, str, str, bool]:
         available = self.list_gallery(event_id, customer_id)
         if photo_ids:
             requested_ids = list(dict.fromkeys(photo_ids))
             available_by_id = {photo["photo_id"]: photo for photo in available}
-            missing = [photo_id for photo_id in requested_ids if photo_id not in available_by_id]
-            if missing:
+            if any(photo_id not in available_by_id for photo_id in requested_ids):
                 raise ValueError("One or more selected photos are not available for download.")
             selected = [available_by_id[photo_id] for photo_id in requested_ids]
         else:
@@ -331,44 +759,30 @@ class PhotoService:
         if not selected:
             raise ValueError("There are no gallery photos available to download.")
 
-        event = self._read_event(event_id)
-        manifest_photos = {
-            photo["photo_id"]: photo
-            for photo in self.storage.read_manifest(event_id)["photos"]
-        }
-        folder_names = {
-            folder["folder_id"]: folder["name"]
-            for folder in self.storage.read_folders(event_id)
-        }
-        downloadable: list[tuple[dict, Path, bool]] = []
-        for photo in selected:
-            manifest_photo = manifest_photos.get(photo["photo_id"])
-            if (
-                not manifest_photo
-                or manifest_photo.get("customer_id") != customer_id
-                or manifest_photo.get("status") not in {"READY", "SUBMITTED_FOR_ALBUM"}
-            ):
-                raise ValueError("One or more selected photos are not available for download.")
-            try:
-                key = self._validated_processed_key(event_id, manifest_photo)
-                path, cleanup = self.storage.materialize(key)
-            except Exception as exc:
-                for _, staged, remove in downloadable:
-                    if remove:
-                        staged.unlink(missing_ok=True)
-                if isinstance(exc, (FileNotFoundError, OSError, ValueError)):
-                    raise ValueError("A processed gallery photo is unavailable for download.") from exc
-                raise
-            downloadable.append((photo, path, cleanup))
+        with self.db.transaction() as connection:
+            event = self._event(connection, event_id)
+            folder_names = {folder["folder_id"]: folder["name"] for folder in self._folders(connection, event_id)}
+            keys = {
+                row["photo_id"]: row
+                for row in connection.execute(
+                    "SELECT photo_id, event_id, processed_key FROM fb_data.media WHERE photo_id = ANY(%s)",
+                    ([photo["photo_id"] for photo in selected],),
+                )
+            }
 
-        if len(downloadable) == 1:
-            photo, path, cleanup = downloadable[0]
-            original_name = Path(photo["original_filename"])
+        def stage(photo: dict) -> tuple[Path, bool]:
+            try:
+                return self.storage.materialize(self._processed_key(keys[photo["photo_id"]]))
+            except (FileNotFoundError, OSError, KeyError) as exc:
+                raise ValueError("A processed gallery photo is unavailable for download.") from exc
+
+        if len(selected) == 1:
+            photo = selected[0]
+            path, cleanup = stage(photo)
             filename = safe_filename(
-                f"{photo['photo_number']:05d}_{original_name.stem}{path.suffix or '.jpg'}"
+                f"{photo['photo_number']:05d}_{Path(photo['original_filename']).stem}{path.suffix or '.jpg'}"
             )
-            media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-            return path, filename, media_type, cleanup
+            return path, filename, mimetypes.guess_type(path.name)[0] or "application/octet-stream", cleanup
 
         self.settings.temp_root.mkdir(parents=True, exist_ok=True)
         file_descriptor, archive_name = tempfile.mkstemp(
@@ -377,456 +791,161 @@ class PhotoService:
         archive_path = Path(archive_name)
         try:
             with os.fdopen(file_descriptor, "wb") as archive_file:
-                with zipfile.ZipFile(
-                    archive_file, "w", compression=zipfile.ZIP_STORED, allowZip64=True
-                ) as archive:
-                    for photo, path, _ in downloadable:
-                        folder_name = safe_filename(folder_names.get(photo.get("folder_id", "root"), "Gallery"))
-                        original_name = Path(photo["original_filename"])
-                        suffix = path.suffix or ".jpg"
-                        entry_name = safe_filename(
-                            f"{photo['photo_number']:05d}_{original_name.stem}{suffix}"
-                        )
-                        archive.write(path, f"{folder_name}/{entry_name}")
-            event_code = safe_filename(event.get("event_code", event_id))
+                with zipfile.ZipFile(archive_file, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+                    for photo in selected:
+                        path, cleanup = stage(photo)
+                        try:
+                            folder_name = safe_filename(folder_names.get(photo["folder_id"], "Gallery"))
+                            entry_name = safe_filename(
+                                f"{photo['photo_number']:05d}_{Path(photo['original_filename']).stem}"
+                                f"{path.suffix or '.jpg'}"
+                            )
+                            archive.write(path, f"{folder_name}/{entry_name}")
+                        finally:
+                            if cleanup:
+                                path.unlink(missing_ok=True)
+            event_code = safe_filename(event["event_code"])
             return archive_path, f"FrameBucket-{event_code}-gallery.zip", "application/zip", True
         except Exception:
             archive_path.unlink(missing_ok=True)
             raise
-        finally:
-            for _, path, cleanup in downloadable:
-                if cleanup:
-                    path.unlink(missing_ok=True)
 
-    def _owned_event(self, event_id: str, photographer_id: str, customer_id: str) -> dict:
-        event_id = validate_id(event_id, "event_id")
+    # ------------------------------------------------------------------ CLI batch helper
+
+    def process_directory(
+        self, input_directory: Path, event_id: str, photographer_id: str, customer_id: str, workers: int = 2
+    ) -> list[dict]:
+        """Ingest every image in a folder and process it in this process (no worker needed)."""
+        if not input_directory.is_dir():
+            raise FileNotFoundError(f"Input folder does not exist: {input_directory}")
+        self.create_event(event_id, photographer_id, customer_id)
+        sources = sorted(
+            (path for path in input_directory.iterdir() if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS),
+            key=lambda path: path.name.lower(),
+        )
+        results = []
+        for path in sources:
+            try:
+                media = self.ingest_file(path, path.name, event_id, photographer_id, customer_id)
+                self.process_media(media["photo_id"])
+                results.append(self._media_dict(self._media_by_id(media["photo_id"])))
+            except Exception as exc:
+                results.append({"original_filename": path.name, "status": "PROCESSING_FAILED", "error": str(exc)})
+        return results
+
+    # ------------------------------------------------------------------ helpers
+
+    @staticmethod
+    def _event(connection: Connection, event_id: str) -> dict:
+        event = connection.execute(
+            "SELECT * FROM fb_data.event WHERE event_id = %s", (validate_id(event_id, "event_id"),)
+        ).fetchone()
+        if not event:
+            raise ValueError("Event not found.")
+        return event
+
+    def _owned_event(self, connection: Connection, event_id: str, photographer_id: str, customer_id: str) -> dict:
         photographer_id = validate_id(photographer_id, "photographer_id")
         customer_id = validate_id(customer_id, "customer_id")
-        event = self._read_event(event_id)
-        if event.get("photographer_id") != photographer_id or event.get("customer_id") != customer_id:
+        event = self._event(connection, event_id)
+        if event["photographer_id"] != photographer_id or event["customer_id"] != customer_id:
             raise ValueError("The event does not belong to the supplied photographer/customer.")
         return event
 
-    def _read_event(self, event_id: str) -> dict:
-        event_id = validate_id(event_id, "event_id")
-        try:
-            return self.storage.read_json(self.storage.event_key(event_id))
-        except FileNotFoundError as exc:
-            raise ValueError("Event not found.") from exc
+    @staticmethod
+    def _media(connection: Connection, event_id: str, photo_id: str) -> dict:
+        media = connection.execute(
+            "SELECT * FROM fb_data.media WHERE event_id = %s AND photo_id = %s",
+            (validate_id(event_id, "event_id"), validate_id(photo_id, "photo_id")),
+        ).fetchone()
+        if not media:
+            raise ValueError("Media not found for this event.")
+        return media
+
+    def _media_by_id(self, photo_id: str) -> dict:
+        with self.db.transaction() as connection:
+            return connection.execute("SELECT * FROM fb_data.media WHERE photo_id = %s", (photo_id,)).fetchone()
+
+    def _visible_media(self, event_id: str, photo_id: str, customer_id: str) -> dict:
+        with self.db.transaction() as connection:
+            event = self._event(connection, event_id)
+            if event["customer_id"] != validate_id(customer_id, "customer_id"):
+                raise ValueError("Customer does not have access to this event.")
+            media = self._media(connection, event_id, photo_id)
+        if media["status"] not in VISIBLE_STATUSES:
+            raise ValueError("Processed photo not found.")
+        return media
+
+    def _photographer_media(self, event_id: str, photo_id: str, photographer_id: str, customer_id: str) -> dict:
+        with self.db.transaction() as connection:
+            self._owned_event(connection, event_id, photographer_id, customer_id)
+            media = self._media(connection, event_id, photo_id)
+        if media["status"] == "UPLOADING":
+            raise ValueError("Photographer original not found.")
+        return media
 
     @staticmethod
-    def _validated_processed_key(event_id: str, photo: dict) -> str:
-        key = normalize_key(photo.get("processed_key", ""))
+    def _folders(connection: Connection, event_id: str) -> list[dict]:
+        rows = connection.execute(
+            "SELECT folder_id, name FROM fb_data.folder WHERE event_id = %s "
+            "ORDER BY (folder_id <> 'root'), created_at, name",
+            (event_id,),
+        ).fetchall()
+        return [dict(row) for row in rows] or [dict(ROOT_FOLDER)]
+
+    @staticmethod
+    def _processed_key(media: dict) -> str:
+        key = normalize_key(media["processed_key"])
+        event_id = media["event_id"]
         if not key.startswith((f"events/{event_id}/photos/", f"events/{event_id}/videos/")):
             raise ValueError("Processed photo not found.")
         return key
 
     @staticmethod
-    def _validated_original_key(event_id: str, photographer_id: str, photo: dict) -> str:
-        key = normalize_key(photo.get("original_key", ""))
-        private_prefix = f"photographer/{photographer_id}/{event_id}/originals/"
-        album_prefix = f"album_design/{event_id}/"
-        if not key.startswith((private_prefix, album_prefix)):
+    def _original_key(media: dict, photographer_id: str) -> str:
+        key = normalize_key(media["original_key"])
+        if not key.startswith(f"photographer/{photographer_id}/{media['event_id']}/originals/"):
             raise ValueError("Photographer original not found.")
         return key
 
-    def upload(
-        self,
-        source: Path,
-        original_filename: str,
-        event_id: str,
-        photographer_id: str,
-        customer_id: str,
-        folder_id: str = "root",
-    ) -> PhotoResult:
-        event_id = validate_id(event_id, "event_id")
-        photographer_id = validate_id(photographer_id, "photographer_id")
-        customer_id = validate_id(customer_id, "customer_id")
-        original_filename = safe_filename(original_filename)
-        extension = Path(original_filename).suffix.lower()
-        if extension not in IMAGE_EXTENSIONS and extension not in VIDEO_EXTENSIONS:
-            raise ValueError(f"Unsupported image or video type: {extension}")
-        media_type = "video" if extension in VIDEO_EXTENSIONS else "image"
-        folder_id = validate_id(folder_id, "folder_id")
-
-        try:
-            event = self._read_event(event_id)
-        except ValueError:
-            self.create_event(event_id, photographer_id, customer_id)
-        else:
-            if event.get("photographer_id") != photographer_id or event.get("customer_id") != customer_id:
-                raise ValueError("The event does not belong to the supplied photographer/customer.")
-
-        photo_id = uuid.uuid4().hex
-        if not any(folder["folder_id"] == folder_id for folder in self.storage.read_folders(event_id)):
-            raise ValueError("Folder not found for this event.")
-        original_key = self.storage.original_key(
-            photographer_id, event_id, photo_id, original_filename, folder_id
-        )
-        processed_key = self.storage.processed_key(event_id, photo_id, folder_id, original_filename)
-
-        with self.storage.lock_for_event(event_id):
-            manifest = self.storage.read_manifest(event_id)
-            photo_number = max(
-                (int(photo.get("photo_number", 0)) for photo in manifest["photos"]),
-                default=0,
-            ) + 1
-            record = {
-                "photo_id": photo_id,
-                "photo_number": photo_number,
-                "event_id": event_id,
-                "photographer_id": photographer_id,
-                "customer_id": customer_id,
-                "original_filename": original_filename,
-                "media_type": media_type,
-                "folder_id": folder_id,
-                "original_key": original_key,
-                "processed_key": processed_key,
-                "status": "PROCESSING",
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
-            manifest["photos"].append(record)
-            self.storage.write_manifest(event_id, manifest)
-
-        self.settings.temp_root.mkdir(parents=True, exist_ok=True)
-        processed_path: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                prefix="processed-", suffix=Path(processed_key).suffix, dir=self.settings.temp_root, delete=False
-            ) as temporary:
-                processed_path = Path(temporary.name)
-            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="fb-photo") as pool:
-                original_future = pool.submit(self.storage.upload_file, original_key, source)
-                if media_type == "image":
-                    process_future = pool.submit(self.processor.process, source, processed_path)
-                else:
-                    process_future = None
-                    shutil.copy2(source, processed_path)
-                processing = process_future.result() if process_future else {
-                    "width": None,
-                    "height": None,
-                    "bytes": processed_path.stat().st_size,
-                    "watermarked": False,
-                    "ai_enhanced": False,
-                }
-                self.storage.upload_file(processed_key, processed_path)
-                original_future.result()
-
-            with self.storage.lock_for_event(event_id):
-                manifest = self.storage.read_manifest(event_id)
-                saved = next(p for p in manifest["photos"] if p["photo_id"] == photo_id)
-                saved.update(
-                    status="READY",
-                    width=processing["width"],
-                    height=processing["height"],
-                    processed_bytes=processing["bytes"],
-                    watermarked=processing["watermarked"],
-                    ai_enhanced=processing["ai_enhanced"],
-                )
-                self.storage.write_manifest(event_id, manifest)
-
-            return PhotoResult(
-                photo_id=photo_id,
-                photo_number=photo_number,
-                event_id=event_id,
-                photographer_id=photographer_id,
-                customer_id=customer_id,
-                original_filename=original_filename,
-                original_key=original_key,
-                processed_key=processed_key,
-                status="READY",
-                media_type=media_type,
-                folder_id=folder_id,
-                width=processing["width"],
-                height=processing["height"],
-                processed_bytes=processing["bytes"],
-                watermarked=bool(processing["watermarked"]),
-                ai_enhanced=bool(processing["ai_enhanced"]),
-            )
-        except Exception as exc:
-            logger.exception("Photo processing failed for %s", photo_id)
-            try:
-                self.storage.delete(processed_key)
-            except Exception:
-                logger.exception("Failed to clean up processed storage key for %s", photo_id)
-            with self.storage.lock_for_event(event_id):
-                manifest = self.storage.read_manifest(event_id)
-                saved = next(p for p in manifest["photos"] if p["photo_id"] == photo_id)
-                saved.update(status="PROCESSING_FAILED", error=str(exc)[:500])
-                self.storage.write_manifest(event_id, manifest)
-            raise
-        finally:
-            if processed_path:
-                processed_path.unlink(missing_ok=True)
-
-    def process_directory(
-        self,
-        input_directory: Path,
-        event_id: str,
-        photographer_id: str,
-        customer_id: str,
-        workers: int = 2,
-    ) -> list[dict]:
-        if not input_directory.is_dir():
-            raise FileNotFoundError(f"Input folder does not exist: {input_directory}")
-        self.create_event(event_id, photographer_id, customer_id)
-        sources = sorted(
-            (
-                path for path in input_directory.iterdir()
-                if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
-            ),
-            key=lambda path: path.name.lower(),
-        )
-        if not sources:
-            return []
-
-        def process_one(path: Path) -> dict:
-            try:
-                return self.upload(
-                    path,
-                    path.name,
-                    event_id,
-                    photographer_id,
-                    customer_id,
-                ).as_dict()
-            except Exception as exc:
-                return {
-                    "original_filename": path.name,
-                    "status": "PROCESSING_FAILED",
-                    "error": str(exc),
-                }
-
-        with ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="fb-batch") as pool:
-            return list(pool.map(process_one, sources))
-
-    def submit_album(
-        self,
-        event_id: str,
-        photographer_id: str,
-        customer_id: str,
-        photo_ids: list[str],
-    ) -> dict:
-        event_id = validate_id(event_id, "event_id")
-        photographer_id = validate_id(photographer_id, "photographer_id")
-        customer_id = validate_id(customer_id, "customer_id")
-        unique_photo_ids = list(dict.fromkeys(photo_ids))
-        if not unique_photo_ids:
-            raise ValueError("Select at least one photo for album design.")
-
-        event = self._read_event(event_id)
-        if event.get("photographer_id") != photographer_id or event.get("customer_id") != customer_id:
-            raise ValueError("The event does not belong to the supplied photographer/customer.")
-
-        with self.storage.lock_for_event(event_id):
-            manifest = self.storage.read_manifest(event_id)
-            photos_by_id = {photo["photo_id"]: photo for photo in manifest["photos"]}
-            selected = []
-            for photo_id in unique_photo_ids:
-                photo = photos_by_id.get(photo_id)
-                if not photo:
-                    raise ValueError(f"Photo {photo_id} does not belong to this event.")
-                if photo.get("status") != "READY":
-                    raise ValueError(f"Photo {photo_id} is not ready for album design.")
-                if photo.get("media_type", "image") != "image":
-                    raise ValueError("Videos cannot be submitted for album design.")
-                if photo.get("photographer_id") != photographer_id or photo.get("customer_id") != customer_id:
-                    raise ValueError(f"Photo {photo_id} belongs to another customer.")
-                selected.append(photo)
-
-            submission_id = uuid.uuid4().hex
-            token = secrets.token_urlsafe(32)
-            submission_prefix = f"album_design/{event_id}/{submission_id}"
-            archive_key = f"{submission_prefix}/album-design.zip"
-            submission_key = f"{submission_prefix}/submission.json"
-            created_keys: list[str] = []
-            staged_files: list[tuple[dict, Path, bool]] = []
-            archive_path: Path | None = None
-            try:
-                for photo in selected:
-                    source_key = self._validated_original_key(event_id, photographer_id, photo)
-                    try:
-                        source, cleanup = self.storage.materialize(
-                            source_key, suffix=Path(photo["original_filename"]).suffix
-                        )
-                    except (FileNotFoundError, OSError) as exc:
-                        raise ValueError("A selected photographer original is unavailable.") from exc
-                    staged_files.append((photo, source, cleanup))
-                    album_original_key = self.storage.album_submission_key(
-                        event_id,
-                        submission_id,
-                        f"{photo['photo_number']:05d}_{photo['original_filename']}",
-                    )
-                    self.storage.upload_file(album_original_key, source)
-                    created_keys.append(album_original_key)
-
-                with tempfile.NamedTemporaryFile(
-                    prefix="album-design-", suffix=".zip", dir=self.settings.temp_root, delete=False
-                ) as temporary:
-                    archive_path = Path(temporary.name)
-                with zipfile.ZipFile(
-                    archive_path, "w", compression=zipfile.ZIP_STORED, allowZip64=True
-                ) as archive:
-                    for photo, source, _ in staged_files:
-                        entry_name = safe_filename(
-                            f"{photo['photo_number']:05d}_{photo['original_filename']}"
-                        )
-                        archive.write(source, arcname=entry_name)
-
-                self.storage.upload_file(archive_key, archive_path)
-                created_keys.append(archive_key)
-                expires_at = datetime.now(timezone.utc) + timedelta(days=30)
-                submission = {
-                    "submission_id": submission_id,
-                    "event_id": event_id,
-                    "event_code": event.get("event_code", event_id),
-                    "photographer_id": photographer_id,
-                    "customer_id": customer_id,
-                    "photo_ids": unique_photo_ids,
-                    "photo_numbers": [
-                        {
-                            "photo_number": photo["photo_number"],
-                            "original_filename": photo["original_filename"],
-                            "folder_id": photo.get("folder_id", "root"),
-                        }
-                        for photo in selected
-                    ],
-                    "share_token": token,
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                    "expires_at": expires_at.isoformat(),
-                    "archive_key": archive_key,
-                }
-                self.storage.write_json(submission_key, submission)
-                created_keys.append(submission_key)
-
-                for photo in selected:
-                    photo["album_design_key"] = self.storage.album_submission_key(
-                        event_id,
-                        submission_id,
-                        f"{photo['photo_number']:05d}_{photo['original_filename']}",
-                    )
-                    photo["album_submission_id"] = submission_id
-                    photo["status"] = "SUBMITTED_FOR_ALBUM"
-                self.storage.write_manifest(event_id, manifest)
-                try:
-                    self.storage.delete(self._album_selection_key(event_id, customer_id))
-                except Exception:
-                    logger.exception("Could not remove album selection draft for event %s", event_id)
-            except Exception:
-                for key in reversed(created_keys):
-                    try:
-                        self.storage.delete(key)
-                    except Exception:
-                        logger.exception("Failed to clean up album storage key %s", key)
-                raise
-            finally:
-                for _, staged, cleanup in staged_files:
-                    if cleanup:
-                        staged.unlink(missing_ok=True)
-                if archive_path:
-                    archive_path.unlink(missing_ok=True)
-
+    @staticmethod
+    def _event_dict(event: dict) -> dict:
         return {
-            "submission_id": submission_id,
-            "event_id": event_id,
-            "photo_count": len(selected),
-            "photo_numbers": submission["photo_numbers"],
-            "album_design_link": f"{self.settings.public_base_url}/api/v1/album-design/{token}",
-            "expires_at": submission["expires_at"],
-            "status": "SUBMITTED",
+            "event_id": event["event_id"],
+            "event_code": event["event_code"],
+            "photographer_id": event["photographer_id"],
+            "customer_id": event["customer_id"],
+            "created_at": event["created_at"].isoformat(),
+            "customer_gallery_key": f"events/{event['event_id']}",
+            "photographer_originals_key": f"photographer/{event['photographer_id']}/{event['event_id']}/originals",
         }
 
-    def resolve_album_link(self, token: str) -> tuple[Path, str, bool]:
-        if not token or len(token) > 200:
-            raise FileNotFoundError("Album design link not found.")
-        for submission_key in self.storage.list_keys("album_design/"):
-            if not submission_key.endswith("/submission.json"):
-                continue
-            try:
-                submission = self.storage.read_json(submission_key)
-            except (OSError, ValueError, json.JSONDecodeError):
-                continue
-            if not secrets.compare_digest(submission.get("share_token", ""), token):
-                continue
-            try:
-                expires = datetime.fromisoformat(submission["expires_at"])
-                archive_key = normalize_key(submission["archive_key"])
-                event_id = validate_id(submission["event_id"], "event_id")
-                submission_id = validate_id(submission["submission_id"], "submission_id")
-            except (KeyError, TypeError, ValueError) as exc:
-                raise FileNotFoundError("Album design archive not found.") from exc
-            if expires <= datetime.now(timezone.utc):
-                raise FileNotFoundError("Album design link has expired.")
-            if not archive_key.startswith(f"album_design/{event_id}/{submission_id}/"):
-                raise FileNotFoundError("Album design archive not found.")
-            try:
-                archive, cleanup = self.storage.materialize(
-                    archive_key, suffix=".zip", prefix="fb-album-"
-                )
-            except (FileNotFoundError, OSError) as exc:
-                raise FileNotFoundError("Album design archive not found.") from exc
-            event_code = safe_filename(submission.get("event_code", event_id))
-            return archive, f"FrameBucket-{event_code}-album-design.zip", cleanup
-        raise FileNotFoundError("Album design link not found.")
+    @staticmethod
+    def _media_dict(media: dict) -> dict:
+        return {
+            "photo_id": media["photo_id"],
+            "photo_number": media["photo_number"],
+            "original_filename": media["original_filename"],
+            "media_type": media["media_type"],
+            "folder_id": media["folder_id"],
+            "width": media["width"],
+            "height": media["height"],
+            "size_bytes": media["size_bytes"],
+            "status": media["status"],
+            "error": media["error"],
+            "ai_enhanced": media["ai_enhanced"],
+            "watermarked": media["watermarked"],
+        }
 
-    def list_gallery(self, event_id: str, customer_id: str, folder_id: str | None = None) -> list[dict]:
-        event_id = validate_id(event_id, "event_id")
-        customer_id = validate_id(customer_id, "customer_id")
-        event = self._read_event(event_id)
-        if event.get("customer_id") != customer_id:
-            raise ValueError("Customer does not have access to this event.")
-        manifest = self.storage.read_manifest(event_id)
-        return [
-            {
-                "photo_id": photo["photo_id"],
-                "photo_number": photo["photo_number"],
-                "original_filename": photo["original_filename"],
-                "media_type": photo.get("media_type", "image"),
-                "folder_id": photo.get("folder_id", "root"),
-                "width": photo.get("width"),
-                "height": photo.get("height"),
-                "status": photo["status"],
-                "ai_enhanced": photo.get("ai_enhanced", False),
-                "watermarked": photo.get("watermarked", False),
-            }
-            for photo in manifest["photos"]
-            if photo.get("status") in {"READY", "SUBMITTED_FOR_ALBUM"}
-            and (folder_id is None or photo.get("folder_id", "root") == folder_id)
-        ]
 
-    def media_path(self, event_id: str, photo_id: str, customer_id: str) -> tuple[Path, bool]:
-        event_id = validate_id(event_id, "event_id")
-        photo_id = validate_id(photo_id, "photo_id")
-        customer_id = validate_id(customer_id, "customer_id")
-        event = self._read_event(event_id)
-        if event.get("customer_id") != customer_id:
-            raise ValueError("Customer does not have access to this event.")
-        manifest = self.storage.read_manifest(event_id)
-        photo = next((item for item in manifest["photos"] if item["photo_id"] == photo_id), None)
-        if not photo or photo.get("status") not in {"READY", "SUBMITTED_FOR_ALBUM"}:
-            raise ValueError("Processed photo not found.")
-        key = self._validated_processed_key(event_id, photo)
-        try:
-            return self.storage.materialize(key)
-        except (FileNotFoundError, OSError) as exc:
-            raise ValueError("Processed photo not found.") from exc
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
-    def preview_path(self, event_id: str, photo_id: str, customer_id: str) -> tuple[Path, bool]:
-        return self.media_path(event_id, photo_id, customer_id)
 
-    def original_path_for_photographer(
-        self, event_id: str, photo_id: str, photographer_id: str, customer_id: str
-    ) -> tuple[Path, bool, str]:
-        event = self._owned_event(event_id, photographer_id, customer_id)
-        photo_id = validate_id(photo_id, "photo_id")
-        manifest = self.storage.read_manifest(event["event_id"])
-        photo = next((item for item in manifest["photos"] if item["photo_id"] == photo_id), None)
-        if not photo or photo.get("photographer_id") != photographer_id:
-            raise ValueError("Photographer original not found.")
-        key = self._validated_original_key(event_id, photographer_id, photo)
-        try:
-            path, cleanup = self.storage.materialize(
-                key, suffix=Path(photo["original_filename"]).suffix
-            )
-            return path, cleanup, safe_filename(photo["original_filename"])
-        except (FileNotFoundError, OSError) as exc:
-            raise ValueError("Photographer original not found.") from exc
+def _clean_content_type(value: str | None) -> str | None:
+    if not value:
+        return None
+    value = value.strip().lower()
+    if len(value) > 100 or "/" not in value or any(character in value for character in "\r\n;,"):
+        return None
+    return value

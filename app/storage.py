@@ -132,6 +132,33 @@ class StorageBackend:
     def list_keys(self, prefix: str) -> list[str]:
         raise NotImplementedError
 
+    def object_size(self, key: str) -> int | None:
+        """Size in bytes, or None when the object does not exist."""
+        raise NotImplementedError
+
+    def copy(self, source_key: str, destination_key: str) -> None:
+        path, cleanup = self.materialize(source_key)
+        try:
+            self.upload_file(destination_key, path)
+        finally:
+            if cleanup:
+                path.unlink(missing_ok=True)
+
+    def presign_put(self, key: str, content_type: str, expires_seconds: int) -> str | None:
+        """Direct browser upload URL, or None when the backend cannot issue one."""
+        return None
+
+    def presign_get(
+        self,
+        key: str,
+        expires_seconds: int,
+        filename: str | None = None,
+        attachment: bool = False,
+        content_type: str | None = None,
+    ) -> str | None:
+        """Short-lived direct download URL, or None when media must be streamed by the service."""
+        return None
+
     def read_text(self, key: str) -> str:
         return self.read_bytes(key).decode("utf-8")
 
@@ -215,6 +242,13 @@ class LocalStorage(StorageBackend):
 
     def delete(self, key: str) -> None:
         self._path(key).unlink(missing_ok=True)
+
+    def object_size(self, key: str) -> int | None:
+        path = self._path(key)
+        return path.stat().st_size if path.is_file() else None
+
+    def copy(self, source_key: str, destination_key: str) -> None:
+        self.upload_file(destination_key, self._path(source_key))
 
     def list_keys(self, prefix: str) -> list[str]:
         root = self._path(prefix) if prefix else self.root
@@ -321,6 +355,52 @@ class S3Storage(StorageBackend):
 
     def delete(self, key: str) -> None:
         self.client.delete_object(Bucket=self.bucket, Key=self._remote_key(key))
+
+    def object_size(self, key: str) -> int | None:
+        from botocore.exceptions import ClientError
+
+        try:
+            response = self.client.head_object(Bucket=self.bucket, Key=self._remote_key(key))
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") in {"404", "NoSuchKey", "NotFound"}:
+                return None
+            raise
+        return int(response["ContentLength"])
+
+    def copy(self, source_key: str, destination_key: str) -> None:
+        self.client.copy(
+            {"Bucket": self.bucket, "Key": self._remote_key(source_key)},
+            self.bucket,
+            self._remote_key(destination_key),
+            Config=self.transfer_config,
+        )
+
+    def presign_put(self, key: str, content_type: str, expires_seconds: int) -> str | None:
+        return self.client.generate_presigned_url(
+            "put_object",
+            Params={"Bucket": self.bucket, "Key": self._remote_key(key), "ContentType": content_type},
+            ExpiresIn=expires_seconds,
+            HttpMethod="PUT",
+        )
+
+    def presign_get(
+        self,
+        key: str,
+        expires_seconds: int,
+        filename: str | None = None,
+        attachment: bool = False,
+        content_type: str | None = None,
+    ) -> str | None:
+        params = {"Bucket": self.bucket, "Key": self._remote_key(key)}
+        if filename or attachment:
+            disposition = "attachment" if attachment else "inline"
+            if filename:
+                disposition += f'; filename="{safe_filename(filename)}"'
+            params["ResponseContentDisposition"] = disposition
+        if content_type:
+            params["ResponseContentType"] = content_type
+        params["ResponseCacheControl"] = "private, max-age=300"
+        return self.client.generate_presigned_url("get_object", Params=params, ExpiresIn=expires_seconds)
 
     def list_keys(self, prefix: str) -> list[str]:
         remote_prefix = self._remote_key(prefix) if prefix else self.prefix
@@ -500,6 +580,14 @@ class GoogleDriveStorage(StorageBackend):
                 return
             self.drive.files().delete(fileId=file_id).execute()
             self._file_ids.pop(normalized, None)
+
+    def object_size(self, key: str) -> int | None:
+        with self._drive_lock:
+            file_id = self._find_file_id(normalize_key(key))
+            if not file_id:
+                return None
+            metadata = self.drive.files().get(fileId=file_id, fields="size").execute()
+        return int(metadata.get("size", 0))
 
     def list_keys(self, prefix: str) -> list[str]:
         with self._drive_lock:

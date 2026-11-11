@@ -5,14 +5,17 @@ Python microservice for FrameBucket gallery media, with local, S3-compatible, an
 ## Implemented
 
 - Creates separate storage areas for private photographer originals and customer event previews.
-- Copies each uploaded source byte-for-byte while independently processing a JPEG preview in parallel.
+- Keeps gallery metadata (events, folders, media, selections, album submissions, face embeddings) in PostgreSQL schema `fb_data`, so any number of API and worker instances can run side by side.
+- Accepts uploads straight into the bucket through short-lived presigned URLs (S3 backend); local and Drive storage fall back to streaming through the app.
+- Processes media on background workers (`python -m app.worker`) fed by a durable PostgreSQL job queue with retries.
+- Keeps each uploaded original byte-for-byte and produces a separate customer JPEG preview.
 - Reads JPEG, PNG, TIFF, WebP, BMP, and common RAW formats (ARW, CR2/CR3, DNG, NEF, ORF, RAF, RW2).
 - Applies restrained exposure, color, contrast, and sharpening adjustments. Output keeps source pixel dimensions; JPEG optimization tries to reduce file size without downscaling.
 - Supports an optional ONNX image-enhancement model. No model is bundled; without one, the response reports ai_enhanced=false.
 - Places the photographer logo in a low-texture corner that does not overlap detected faces. If face detection is unavailable or no safe corner exists, the logo is skipped.
-- Submits selected photo IDs for album design, moves those originals into a private album-design folder, and creates a random expiring ZIP link.
+- Submits selected photo IDs for album design and returns an expiring link immediately; a worker packages the originals into a private ZIP, and the link serves it once ready.
 - Provides a protected FastAPI API for the existing app backend.
-- Supports opt-in, per-event face matching for guest QR check-in. Face embeddings are stored with that event's metadata; uploaded selfies are processed in memory and are not saved as gallery media.
+- Supports opt-in, per-event face matching for guest QR check-in. Face embeddings are stored in PostgreSQL per event; uploaded selfies are processed in memory and are not saved as gallery media.
 
 The local gallery is integrated with the FrameBucket Spring Boot app. It supports photographer folders, image and video upload, parallel original/preview writes, customer preview galleries, photo selection, and album-design ZIP handoff. WhatsApp delivery uses the app's existing console mode locally; configure an approved WhatsApp template for live delivery. Production queueing and object storage are described in [INFRASTRUCTURE.md](INFRASTRUCTURE.md).
 
@@ -33,17 +36,53 @@ python -m pip install --upgrade pip
 pip install -e .
 ~~~
 
-2. Copy `.env.example` to `.env`. Set a long random `FB_SERVICE_TOKEN` and `FB_DATA_ROOT`. Set the same token in the Java backend as `DATA_SERVICE_TOKEN`. Optionally set `FB_LOGO_PATH` to a transparent PNG and `FB_PUBLIC_BASE_URL` to a URL the album designer can reach. The service loads `.env` automatically.
+2. Copy `.env.example` to `.env`. Set a long random `FB_SERVICE_TOKEN`, `FB_DATA_ROOT`, and `FB_DATABASE_URL` (the same PostgreSQL database the Java app uses, e.g. `postgresql://postgres:<password>@localhost:5432/fb_main`). The service creates and migrates its own `fb_data` schema on startup. Set the same token in the Java backend as `DATA_SERVICE_TOKEN`. Optionally set `FB_LOGO_PATH` to a transparent PNG and `FB_PUBLIC_BASE_URL` to a URL the album designer can reach. The service loads `.env` automatically.
 
-3. Start the API in a separate terminal after installing the package:
+3. Start the API and a worker in separate terminals after installing the package:
 
 ~~~powershell
 uvicorn app.api:app --host 127.0.0.1 --port 8001
+python -m app.worker
 ~~~
+
+For local development you can skip the second terminal by setting `FB_EMBEDDED_WORKER=true`, which runs worker threads inside the API process. Uploaded media stay in the **Queued** state until a worker processes them.
 
 4. Start the Spring Boot backend with `DATA_SERVICE_TOKEN` set to the same token, then start the React frontend as usual. The Data tab requires a plan with Data enabled. Events can be provisioned when created; if the Python service was offline, opening that event gallery provisions its storage.
 
-For Railway/Railpack deployment, build from the root of this Python service repository (the directory containing `pyproject.toml` and `railpack.json`). The Railpack config starts `app.api:app` with Uvicorn on `0.0.0.0:$PORT`.
+For Railway/Railpack deployment, build from the root of this Python service repository (the directory containing `pyproject.toml` and `railpack.json`). The Railpack config starts `app.api:app` with Uvicorn on `0.0.0.0:$PORT`. See **Deploying on Railway** below for the worker service and bucket CORS.
+
+## Upgrading from 0.1 (JSON metadata)
+
+Version 0.1 kept gallery metadata as JSON files under `metadata/`, `tmp/album-selections/`, and `album_design/*/submission.json` in storage. Version 0.2 reads only PostgreSQL. After setting `FB_DATABASE_URL`, import the existing records once with the same storage settings the service used before:
+
+~~~powershell
+python scripts/import_json_metadata.py --dry-run
+python scripts/import_json_metadata.py
+~~~
+
+The import is idempotent and leaves the JSON files in place. Existing album-design links keep working. Photos imported without cached face embeddings are queued for a face scan, so start a worker afterwards.
+
+## Deploying on Railway
+
+Run three services from the code: the Java app, the data API, and one or more data workers. All three use the existing Railway PostgreSQL database.
+
+1. **Data API** (this repository, default Railpack start command). Set `FB_DATABASE_URL=${{Postgres.DATABASE_URL}}`, `FB_SERVICE_TOKEN`, `FB_PUBLIC_BASE_URL`, `FB_STORAGE_BACKEND=s3` and the bucket variables. Several replicas may run; the API is stateless.
+2. **Data worker**: create another service from the same repository with the same variables, and set its custom start command to `python -m app.worker`. Do not give it a public domain. Scale replicas (or `FB_WORKER_CONCURRENCY`) to match upload volume. Give it enough ephemeral disk for the largest RAW plus the largest album ZIP (`FB_TEMP_ROOT`).
+3. **Bucket CORS** for direct browser uploads: allow the public frontend origin to `PUT` and `GET`. With the bucket's credentials:
+
+~~~bash
+aws s3api put-bucket-cors --bucket <BUCKET> --endpoint-url <ENDPOINT> --cors-configuration '{
+  "CORSRules": [{
+    "AllowedOrigins": ["https://www.framebucket.in"],
+    "AllowedMethods": ["PUT", "GET", "HEAD"],
+    "AllowedHeaders": ["*"],
+    "ExposeHeaders": ["ETag"],
+    "MaxAgeSeconds": 3600
+  }]
+}'
+~~~
+
+Without CORS the browser blocks the direct upload. Set `FB_DIRECT_UPLOADS=false` to route uploads through the Java app instead (slower, but needs no CORS).
 
 ## Choose persistent storage
 
@@ -115,8 +154,13 @@ Send the X-FrameBucket-Service-Key header from the trusted Spring Boot backend. 
 - GET /health
 - POST /api/v1/events — create event storage areas.
 - GET/POST /api/v1/events/{event_id}/folders — list or create folders (requires photographer_id and customer_id query parameters).
-- POST /api/v1/events/{event_id}/photos?photographer_id=...&customer_id=...&folder_id=... — multipart field `file`; accepts supported images and videos.
-- GET /api/v1/events/{event_id}/photos?customer_id=...&folder_id=... — list customer-visible previews.
+- POST /api/v1/events/{event_id}/uploads — JSON `{photographer_id, customer_id, folder_id, filename, size_bytes, content_type}`; registers an upload and returns `photo_id` plus a presigned `upload_url` (null when the backend cannot presign).
+- PUT /api/v1/events/{event_id}/uploads/{photo_id}/content?photographer_id=...&customer_id=... — raw file body; fallback when `upload_url` is null.
+- POST /api/v1/events/{event_id}/uploads/{photo_id}/complete?photographer_id=...&customer_id=... — verifies the original, assigns the photo number, and queues processing.
+- POST /api/v1/events/{event_id}/photos?photographer_id=...&customer_id=...&folder_id=... — single-request multipart upload (field `file`) for scripts; the file is queued.
+- GET /api/v1/events/{event_id}/photos?customer_id=...&folder_id=...&include_pending=false — list gallery media; `include_pending=true` also returns queued, processing, and failed items.
+- GET /api/v1/events/{event_id}/photos/{photo_id}/preview-url?customer_id=... and /original-url?photographer_id=...&customer_id=... — short-lived direct storage URLs (null for local/Drive storage).
+- POST /api/v1/outbox/claim and /api/v1/outbox/ack — notifications for the Java app (`face_match`, `album_ready`, `album_failed`), leased so several app instances can poll safely.
 - GET /api/v1/events/{event_id}/album-selection — load the customer's temporary album selection.
 - PUT /api/v1/events/{event_id}/album-selection — save selected photo IDs to the temporary selection store.
 - POST /api/v1/events/{event_id}/downloads — JSON `{"customer_id":"...","photo_ids":[]}` returns one customer-visible item directly, or multiple/all items as a ZIP; pass photo IDs to download only selected items.
@@ -131,7 +175,7 @@ Example upload from PowerShell:
 curl.exe -H "X-FrameBucket-Service-Key: $env:FB_SERVICE_TOKEN" -F "file=@C:\path\to\sample.jpg" "http://127.0.0.1:8001/api/v1/events/DEMO_EVENT/photos?photographer_id=DEMO_PHOTOGRAPHER&customer_id=DEMO_CUSTOMER"
 ~~~
 
-A successful album submission returns album_design_link, photo_numbers, and an expiry. The Spring Boot app stores the returned link in the photographer event list and sends the configured WhatsApp template. The customer API returns only whether a selection was submitted, never the designer link. The local ZIP URL is a bearer link: anyone holding it can download the selected originals until it expires.
+A successful album submission returns album_design_link, photo_numbers, and an expiry. The Spring Boot app stores the returned link in the photographer event list; when the worker finishes the ZIP, the `album_ready` notification makes the app send the email and WhatsApp template. Until then the link answers HTTP 202 with a "being prepared" message. The customer API returns only whether a selection was submitted, never the designer link. The local ZIP URL is a bearer link: anyone holding it can download the selected originals until it expires.
 
 ## Storage layout
 
@@ -141,9 +185,8 @@ data_output/
   photographer/<photographer>/<event>/originals/<folder>/
   events/<event>/photos/<folder>/         # customer-visible image derivatives only
   events/<event>/videos/<folder>/         # customer-visible video copies
-  album_design/<event>/<submission>/       # selected originals and ZIP
-  metadata/events/<event>/                # event, folder, and media manifests
-  tmp/                                    # temporary uploads, customer ZIPs, and album-selection drafts
+  album_design/<event>/<submission>/       # album-design ZIP
+  tmp/                                    # temporary processing files and customer ZIPs (local backend)
 ~~~
 
-The same logical key layout is used by all adapters. The private photographer path is never returned by the customer gallery API. See INFRASTRUCTURE.md for production considerations.
+Metadata lives in PostgreSQL (`fb_data` schema), not in storage. The same logical key layout is used by all adapters. The private photographer path is never returned by the customer gallery API. See INFRASTRUCTURE.md for production considerations.

@@ -5,18 +5,20 @@ import logging
 import mimetypes
 import re
 import tempfile
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
+from . import jobs
 from .config import Settings
 from .imaging import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
-from .service import PhotoService
+from .service import AlbumNotReady, DirectDownload, PhotoService
 from .storage import safe_filename
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -24,10 +26,29 @@ settings = Settings.from_env()
 service = PhotoService(settings)
 MAX_GUEST_SELFIE_BYTES = 8 * 1024 * 1024
 
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    service.db.migrate()
+    embedded = None
+    if settings.embedded_worker:
+        from .worker import WorkerPool
+
+        embedded = WorkerPool(service, settings)
+        embedded.start()
+    try:
+        yield
+    finally:
+        if embedded:
+            embedded.stop()
+        service.db.close()
+
+
 app = FastAPI(
     title="FrameBucket Data Service",
-    version="0.1.0",
+    version="0.2.0",
     description="Gallery and photo-processing service with local, S3-compatible, and Google Drive storage.",
+    lifespan=lifespan,
 )
 
 
@@ -59,6 +80,24 @@ class GalleryDownloadRequest(BaseModel):
     photo_ids: list[str] = Field(default_factory=list, max_length=5000)
 
 
+class UploadInit(BaseModel):
+    photographer_id: str = Field(min_length=1, max_length=128)
+    customer_id: str = Field(min_length=1, max_length=128)
+    folder_id: str = Field(default="root", min_length=1, max_length=128)
+    filename: str = Field(min_length=1, max_length=255)
+    size_bytes: int = Field(gt=0)
+    content_type: str | None = Field(default=None, max_length=255)
+
+
+class OutboxClaim(BaseModel):
+    limit: int = Field(default=50, ge=1, le=500)
+    lease_seconds: int = Field(default=120, ge=10, le=3600)
+
+
+class OutboxAck(BaseModel):
+    ids: list[int] = Field(default_factory=list, max_length=500)
+
+
 def require_service_key(
     supplied: Annotated[str | None, Header(alias="X-FrameBucket-Service-Key")] = None,
 ) -> None:
@@ -74,6 +113,10 @@ def require_service_key(
 
 @app.get("/health")
 def health() -> dict:
+    try:
+        service.db.ping()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Database unavailable.") from exc
     return {"status": "ok", "service": "fb-data"}
 
 
@@ -134,6 +177,53 @@ def create_folder(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+@app.post("/api/v1/events/{event_id}/uploads", dependencies=[Depends(require_service_key)])
+def init_upload(event_id: str, payload: UploadInit) -> dict:
+    """Register an upload. Returns a direct (presigned) PUT URL when the storage backend supports it;
+    otherwise upload_url is null and the caller sends the bytes to the /content endpoint."""
+    try:
+        return service.init_upload(
+            event_id, payload.photographer_id, payload.customer_id, payload.folder_id,
+            payload.filename, payload.size_bytes, payload.content_type,
+        )
+    except ValueError as exc:
+        status = 413 if "upload limit" in str(exc) else 422
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
+
+
+@app.put("/api/v1/events/{event_id}/uploads/{photo_id}/content", dependencies=[Depends(require_service_key)])
+async def upload_content(
+    event_id: str,
+    photo_id: str,
+    request: Request,
+    photographer_id: str = Query(min_length=1, max_length=128),
+    customer_id: str = Query(min_length=1, max_length=128),
+) -> dict:
+    temporary_path = await _receive_body(request)
+    try:
+        await run_in_threadpool(
+            service.receive_upload_content, event_id, photo_id, photographer_id, customer_id, temporary_path
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return {"status": "RECEIVED"}
+
+
+@app.post("/api/v1/events/{event_id}/uploads/{photo_id}/complete", dependencies=[Depends(require_service_key)])
+def complete_upload(
+    event_id: str,
+    photo_id: str,
+    photographer_id: str = Query(min_length=1, max_length=128),
+    customer_id: str = Query(min_length=1, max_length=128),
+) -> dict:
+    try:
+        return service.complete_upload(event_id, photo_id, photographer_id, customer_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 @app.post("/api/v1/events/{event_id}/photos", dependencies=[Depends(require_service_key)])
 async def upload_photo(
     event_id: str,
@@ -142,6 +232,7 @@ async def upload_photo(
     customer_id: str = Query(min_length=1, max_length=128),
     folder_id: str = Query(default="root", min_length=1, max_length=128),
 ) -> dict:
+    """Single-request multipart upload for scripts. The file is queued; a worker processes it."""
     try:
         original_filename = safe_filename(file.filename or "upload")
         suffix = Path(original_filename).suffix.lower()
@@ -163,47 +254,51 @@ async def upload_photo(
                 if total > settings.max_upload_bytes:
                     raise HTTPException(status_code=413, detail="File exceeds the upload limit.")
                 temporary.write(chunk)
-
         if total == 0:
             raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-
         try:
-            result = await run_in_threadpool(
-                service.upload,
-                temporary_path,
-                original_filename,
-                event_id,
-                photographer_id,
-                customer_id,
-                folder_id,
+            return await run_in_threadpool(
+                service.ingest_file, temporary_path, original_filename,
+                event_id, photographer_id, customer_id, folder_id,
             )
-            payload = result.as_dict()
-            if result.media_type == "image":
-                try:
-                    payload["matched_guest_ids"] = await run_in_threadpool(
-                        service.match_uploaded_photo_faces,
-                        event_id,
-                        result.photo_id,
-                        customer_id,
-                    )
-                except Exception:
-                    logging.getLogger(__name__).exception(
-                        "Face matching failed for photo %s; upload remains available in the gallery.",
-                        result.photo_id,
-                    )
-                    payload["matched_guest_ids"] = []
-            else:
-                payload["matched_guest_ids"] = []
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        except Exception as exc:
-            logging.getLogger(__name__).exception("Upload processing failed.")
-            raise HTTPException(status_code=422, detail=f"Could not process media: {exc}") from exc
-        return payload
     finally:
         if temporary_path:
             temporary_path.unlink(missing_ok=True)
         await file.close()
+
+
+async def _receive_body(request: Request) -> Path:
+    settings.temp_root.mkdir(parents=True, exist_ok=True)
+    total = 0
+    with tempfile.NamedTemporaryFile(prefix="upload-", dir=settings.temp_root, delete=False) as temporary:
+        path = Path(temporary.name)
+        try:
+            async for chunk in request.stream():
+                total += len(chunk)
+                if total > settings.max_upload_bytes:
+                    raise HTTPException(status_code=413, detail="File exceeds the upload limit.")
+                temporary.write(chunk)
+        except BaseException:
+            temporary.close()
+            path.unlink(missing_ok=True)
+            raise
+    if total == 0:
+        path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    return path
+
+
+@app.post("/api/v1/outbox/claim", dependencies=[Depends(require_service_key)])
+def claim_outbox(payload: OutboxClaim) -> dict:
+    """Lease pending notifications (face matches, album archives) for the Java application."""
+    return {"items": jobs.claim_outbox(service.db, payload.limit, payload.lease_seconds)}
+
+
+@app.post("/api/v1/outbox/ack", dependencies=[Depends(require_service_key)])
+def ack_outbox(payload: OutboxAck) -> dict:
+    return {"acknowledged": jobs.ack_outbox(service.db, payload.ids)}
 
 
 @app.post("/api/v1/events/{event_id}/guests/{guest_id}/face", dependencies=[Depends(require_service_key)])
@@ -257,9 +352,10 @@ def list_event_photos(
     event_id: str,
     customer_id: str = Query(min_length=1, max_length=128),
     folder_id: str | None = Query(default=None, max_length=128),
+    include_pending: bool = Query(default=False),
 ) -> dict:
     try:
-        return {"photos": service.list_gallery(event_id, customer_id, folder_id)}
+        return {"photos": service.list_gallery(event_id, customer_id, folder_id, include_pending)}
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -302,6 +398,38 @@ def get_whatsapp_preview(
         media_type="image/jpeg",
         headers={"Cache-Control": "private, no-store"},
     )
+
+
+@app.get(
+    "/api/v1/events/{event_id}/photos/{photo_id}/preview-url",
+    dependencies=[Depends(require_service_key)],
+)
+def get_preview_url(
+    event_id: str,
+    photo_id: str,
+    customer_id: str = Query(min_length=1, max_length=128),
+) -> dict:
+    """Short-lived direct URL for the processed media, or null when it must be streamed."""
+    try:
+        return {"url": service.media_url(event_id, photo_id, customer_id)}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get(
+    "/api/v1/events/{event_id}/photos/{photo_id}/original-url",
+    dependencies=[Depends(require_service_key)],
+)
+def get_original_url(
+    event_id: str,
+    photo_id: str,
+    photographer_id: str = Query(min_length=1, max_length=128),
+    customer_id: str = Query(min_length=1, max_length=128),
+) -> dict:
+    try:
+        return {"url": service.original_url(event_id, photo_id, photographer_id, customer_id)}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.get(
@@ -415,12 +543,20 @@ def submit_album(event_id: str, payload: AlbumSubmissionCreate) -> dict:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@app.get("/api/v1/album-design/{token}")
-def download_album_design(token: str) -> FileResponse:
+@app.get("/api/v1/album-design/{token}", response_model=None)
+def download_album_design(token: str) -> Response:
     try:
         path, filename, cleanup = service.resolve_album_link(token)
+    except AlbumNotReady as exc:
+        return JSONResponse(
+            status_code=202,
+            content={"status": "PREPARING", "detail": str(exc)},
+            headers={"Retry-After": "60", "Cache-Control": "no-store"},
+        )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if isinstance(path, DirectDownload):
+        return RedirectResponse(path.url, status_code=302, headers={"Cache-Control": "no-store"})
     return FileResponse(
         path,
         media_type="application/zip",

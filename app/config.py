@@ -15,6 +15,13 @@ def _path_from_env(name: str, default: Path) -> Path:
     return Path(os.getenv(name, str(default))).expanduser().resolve()
 
 
+def _flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _google_folder_id(value: str) -> str | None:
     raw = value.strip()
     if not raw:
@@ -61,6 +68,17 @@ class Settings:
     face_detector_model_url: str
     face_recognizer_model_url: str
     face_match_threshold: float
+    database_url: str | None
+    db_pool_size: int
+    direct_uploads: bool
+    upload_url_ttl_seconds: int
+    media_url_ttl_seconds: int
+    worker_concurrency: int
+    worker_poll_seconds: float
+    job_lease_seconds: int
+    job_max_attempts: int
+    embedded_worker: bool
+    abandoned_upload_hours: int
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -115,6 +133,17 @@ class Settings:
                 "https://github.com/opencv/opencv_zoo/raw/refs/heads/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx",
             ).strip(),
             face_match_threshold=float(os.getenv("FB_FACE_MATCH_THRESHOLD", "0.42")),
+            database_url=(os.getenv("FB_DATABASE_URL") or os.getenv("DATABASE_URL") or "").strip() or None,
+            db_pool_size=max(2, int(os.getenv("FB_DB_POOL_SIZE", "10"))),
+            direct_uploads=_flag("FB_DIRECT_UPLOADS", True),
+            upload_url_ttl_seconds=int(os.getenv("FB_UPLOAD_URL_TTL_SECONDS", "3600")),
+            media_url_ttl_seconds=int(os.getenv("FB_MEDIA_URL_TTL_SECONDS", "600")),
+            worker_concurrency=max(1, int(os.getenv("FB_WORKER_CONCURRENCY", "2"))),
+            worker_poll_seconds=float(os.getenv("FB_WORKER_POLL_SECONDS", "2")),
+            job_lease_seconds=int(os.getenv("FB_JOB_LEASE_SECONDS", "1800")),
+            job_max_attempts=max(1, int(os.getenv("FB_JOB_MAX_ATTEMPTS", "5"))),
+            embedded_worker=_flag("FB_EMBEDDED_WORKER", False),
+            abandoned_upload_hours=int(os.getenv("FB_ABANDONED_UPLOAD_HOURS", "24")),
         )
 
     @property
