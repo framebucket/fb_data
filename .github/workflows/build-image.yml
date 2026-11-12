@@ -1,0 +1,74 @@
+name: Build and push image
+
+# Builds the FrameBucket data service image (API + worker) and pushes it to the target
+# environment's ECR repository. Run the matching Terraform workflow first so the repository
+# exists. Deploy afterwards from the fb_terraform repository (operation "deploy").
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_environment:
+        description: "Which environment's registry to push to"
+        required: true
+        type: choice
+        options:
+          - staging
+          - prod
+        default: staging
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: build-image-${{ inputs.target_environment }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build for ${{ inputs.target_environment }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: ${{ inputs.target_environment }}
+    env:
+      REPO_PREFIX: framebucket-${{ inputs.target_environment }}
+      IMAGE_TAG: ${{ github.sha }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Configure AWS credentials with GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || secrets.AWS_REGION }}
+          mask-aws-account-id: true
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push data service image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ env.REPO_PREFIX }}/data:${{ env.IMAGE_TAG }}
+            ${{ steps.ecr.outputs.registry }}/${{ env.REPO_PREFIX }}/data:latest
+          cache-from: type=gha,scope=data
+          cache-to: type=gha,mode=max,scope=data
+
+      - name: Summary
+        run: |
+          {
+            echo "### Image pushed to ${REPO_PREFIX}/data"
+            echo ""
+            echo "Image tag: \`${IMAGE_TAG}\` (also tagged \`latest\`)"
+            echo ""
+            echo "Deploy from **fb_terraform → Actions** with operation \`deploy\` and data image tag \`${IMAGE_TAG}\` (or \`latest\`)."
+          } >> "$GITHUB_STEP_SUMMARY"
