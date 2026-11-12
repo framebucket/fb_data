@@ -28,4 +28,4 @@ ENV FB_TEMP_ROOT=/data/tmp \
     PORT=8001
 
 EXPOSE 8001
-CMD ["sh", "-c", "exec python -m uvicorn app.api:app --host 0.0.0.0 --port ${PORT} --proxy-headers --forwarded-allow-ips='*'"]
+CMD ["python", "-m", "app.serve"]
