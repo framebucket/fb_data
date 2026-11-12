@@ -265,17 +265,21 @@ class LocalStorage(StorageBackend):
 class S3Storage(StorageBackend):
     def __init__(self, settings: Settings) -> None:
         super().__init__(settings)
+        # FB_S3_ENDPOINT_URL is only needed for S3-compatible stores (Railway Buckets, MinIO).
+        # On AWS, leave the endpoint and access keys unset: boto3 then uses the default credential
+        # chain (EC2 instance role or EKS Pod Identity), so no long-lived keys are stored.
         missing = [
             name for name, value in (
-                ("FB_S3_ENDPOINT_URL", settings.s3_endpoint_url),
                 ("FB_S3_BUCKET", settings.s3_bucket),
                 ("FB_S3_REGION", settings.s3_region),
-                ("FB_S3_ACCESS_KEY_ID", settings.s3_access_key_id),
-                ("FB_S3_SECRET_ACCESS_KEY", settings.s3_secret_access_key),
             ) if not value
         ]
         if missing:
             raise ValueError("S3 storage is missing required settings: " + ", ".join(missing))
+        if bool(settings.s3_access_key_id) != bool(settings.s3_secret_access_key):
+            raise ValueError(
+                "Set both FB_S3_ACCESS_KEY_ID and FB_S3_SECRET_ACCESS_KEY, or neither to use AWS role credentials."
+            )
 
         import boto3
         from botocore.config import Config

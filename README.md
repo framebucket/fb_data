@@ -88,6 +88,8 @@ Without CORS the browser blocks the direct upload. Set `FB_DIRECT_UPLOADS=false`
 
 Set `FB_STORAGE_BACKEND` to `local`, `s3`, or `google_drive`. The default `local` backend is intended for local development or a persistent mounted volume. Railway Buckets use Railway's S3-compatible endpoint and credentials, so select `s3`; the endpoint URL alone is not a filesystem mount. The service stores event records, folder lists, manifests, private originals, processed gallery media, temporary album selections, album originals, and ZIP files in the selected backend. Image processing and responses still use `FB_TEMP_ROOT` (or the system temporary directory for remote backends), which must have enough writable space for the largest in-flight upload and archive.
 
+On **AWS S3** (the prod and staging stacks in fb_terraform), set only `FB_STORAGE_BACKEND=s3`, `FB_S3_BUCKET` and `FB_S3_REGION`. Leave `FB_S3_ENDPOINT_URL` and the access keys unset: the service then uses the EC2 instance role or EKS Pod Identity, so no long-lived keys are stored. The container image is built from the `Dockerfile` in this repository (`python -m app.worker` runs the worker from the same image).
+
 For a Railway Bucket, configure these variables on the Python service:
 
 ~~~text
