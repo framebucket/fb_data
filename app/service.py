@@ -22,6 +22,8 @@ from psycopg.types.json import Jsonb
 
 from . import jobs
 from . import style as style_engine
+from .album_service import AlbumDesignMixin, DesignNotReady  # noqa: F401  (re-exported for the API)
+from .invitation_service import InvitationMixin
 from .config import Settings
 from .db import Database
 from .face_matching import MAX_IMAGE_PIXELS, EventFaceMatcher
@@ -49,7 +51,7 @@ class DirectDownload:
     url: str
 
 
-class PhotoService:
+class PhotoService(AlbumDesignMixin, InvitationMixin):
     def __init__(self, settings: Settings, database: Database | None = None) -> None:
         self.settings = settings
         self.storage: StorageBackend = create_storage(settings)
@@ -254,6 +256,10 @@ class PhotoService:
             self.scan_faces(payload["photo_id"])
         elif kind == jobs.BUILD_ALBUM:
             self.build_album(payload["submission_id"])
+        elif kind == jobs.DESIGN_ALBUM:
+            self.design_album(payload["design_id"])
+        elif kind == jobs.RENDER_INVITATION:
+            self.render_invitation(payload["event_id"])
         else:
             raise PermanentJobError(f"Unknown job kind: {kind}")
 
@@ -275,6 +281,16 @@ class PhotoService:
                 if row:
                     jobs.publish(connection, jobs.OUTBOX_ALBUM_FAILED, row["event_id"],
                                  {"submission_id": payload.get("submission_id"), "error": error[:500]})
+            elif kind == jobs.DESIGN_ALBUM:
+                connection.execute(
+                    "UPDATE fb_data.album_design SET status = 'FAILED', error = %s WHERE design_id = %s",
+                    (error[:500], payload.get("design_id")),
+                )
+            elif kind == jobs.RENDER_INVITATION:
+                connection.execute(
+                    "UPDATE fb_data.invitation SET status = 'FAILED', error = %s WHERE event_id = %s AND status = 'RENDERING'",
+                    (error[:500], payload.get("event_id")),
+                )
 
     def process_media(self, photo_id: str) -> None:
         photo_id = validate_id(photo_id, "photo_id")

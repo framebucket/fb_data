@@ -36,4 +36,4 @@ fb-data-worker = "app.worker:main"
 include = ["app*"]
 
 [tool.setuptools.package-data]
-app = ["migrations/*.sql"]
+app = ["migrations/*.sql", "assets/fonts/*"]

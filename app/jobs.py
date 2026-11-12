@@ -11,6 +11,8 @@ from .db import Database
 PROCESS_MEDIA = "process_media"
 SCAN_FACES = "scan_faces"
 BUILD_ALBUM = "build_album"
+DESIGN_ALBUM = "design_album"
+RENDER_INVITATION = "render_invitation"
 
 OUTBOX_FACE_MATCH = "face_match"
 OUTBOX_ALBUM_READY = "album_ready"

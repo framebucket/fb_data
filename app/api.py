@@ -18,8 +18,9 @@ from starlette.concurrency import run_in_threadpool
 from . import jobs
 from .config import Settings
 from .imaging import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
-from .service import AlbumNotReady, DirectDownload, PhotoService
+from .service import AlbumNotReady, DesignNotReady, DirectDownload, PhotoService
 from .style import MAX_REFERENCES, StyleError
+from .invitation import InvitationError
 from .storage import safe_filename
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -74,6 +75,22 @@ class AlbumSelectionUpdate(BaseModel):
     photographer_id: str = Field(min_length=1, max_length=128)
     customer_id: str = Field(min_length=1, max_length=128)
     photo_ids: list[str] = Field(default_factory=list, max_length=50000)
+
+
+class AlbumDesignCreate(BaseModel):
+    photographer_id: str = Field(min_length=1, max_length=128)
+    customer_id: str = Field(min_length=1, max_length=128)
+    submission_id: str = Field(min_length=1, max_length=128)
+    height_in: float = Field(ge=6, le=24)
+    width_in: float = Field(ge=12, le=48)
+    sheets: int = Field(ge=1, le=120)
+    dpi: int = Field(default=300)
+    size_label: str | None = Field(default=None, max_length=20)
+
+
+class OwnerRef(BaseModel):
+    photographer_id: str = Field(min_length=1, max_length=128)
+    customer_id: str = Field(min_length=1, max_length=128)
 
 
 class GalleryDownloadRequest(BaseModel):
@@ -636,6 +653,195 @@ def download_album_design(token: str) -> Response:
         path,
         media_type="application/zip",
         filename=filename,
+        headers={"Cache-Control": "private, no-store"},
+        background=BackgroundTask(lambda: path.unlink(missing_ok=True)) if cleanup else None,
+    )
+
+
+# ------------------------------------------------------------------ album auto-design
+
+
+@app.get("/api/v1/events/{event_id}/album-designs", dependencies=[Depends(require_service_key)])
+def list_album_designs(
+    event_id: str,
+    photographer_id: str = Query(min_length=1, max_length=128),
+    customer_id: str = Query(min_length=1, max_length=128),
+) -> dict:
+    try:
+        return {"submissions": service.album_submissions(event_id, photographer_id, customer_id)}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/events/{event_id}/album-designs", dependencies=[Depends(require_service_key)])
+def create_album_design(event_id: str, payload: AlbumDesignCreate) -> dict:
+    try:
+        return service.create_album_design(
+            event_id, payload.photographer_id, payload.customer_id, payload.submission_id,
+            payload.height_in, payload.width_in, payload.sheets, payload.dpi, payload.size_label,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/events/{event_id}/album-designs/{design_id}", dependencies=[Depends(require_service_key)])
+def get_album_design(
+    event_id: str,
+    design_id: str,
+    photographer_id: str = Query(min_length=1, max_length=128),
+    customer_id: str = Query(min_length=1, max_length=128),
+) -> dict:
+    try:
+        return service.album_design_status(event_id, design_id, photographer_id, customer_id)
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get(
+    "/api/v1/events/{event_id}/album-designs/{design_id}/spreads/{index}",
+    dependencies=[Depends(require_service_key)],
+)
+def get_album_design_spread(
+    event_id: str,
+    design_id: str,
+    index: int,
+    photographer_id: str = Query(min_length=1, max_length=128),
+    customer_id: str = Query(min_length=1, max_length=128),
+) -> FileResponse:
+    try:
+        path, cleanup = service.album_design_preview(event_id, design_id, index, photographer_id, customer_id)
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return FileResponse(
+        path,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "private, max-age=3600"},
+        background=BackgroundTask(lambda: path.unlink(missing_ok=True)) if cleanup else None,
+    )
+
+
+@app.get(
+    "/api/v1/events/{event_id}/album-designs/{design_id}/download/{kind}",
+    dependencies=[Depends(require_service_key)],
+    response_model=None,
+)
+def download_album_design_archive(
+    event_id: str,
+    design_id: str,
+    kind: str,
+    photographer_id: str = Query(min_length=1, max_length=128),
+    customer_id: str = Query(min_length=1, max_length=128),
+) -> Response:
+    if kind not in {"psd", "jpeg"}:
+        raise HTTPException(status_code=404, detail="Unknown archive.")
+    try:
+        path, filename, cleanup = service.album_design_download(
+            event_id, design_id, kind, photographer_id, customer_id
+        )
+    except DesignNotReady as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if isinstance(path, DirectDownload):
+        return RedirectResponse(path.url, status_code=302, headers={"Cache-Control": "no-store"})
+    return FileResponse(
+        path,
+        media_type="application/zip",
+        filename=filename,
+        headers={"Cache-Control": "private, no-store"},
+        background=BackgroundTask(lambda: path.unlink(missing_ok=True)) if cleanup else None,
+    )
+
+
+@app.post(
+    "/api/v1/events/{event_id}/album-designs/{design_id}/publish",
+    dependencies=[Depends(require_service_key)],
+)
+def publish_album_design(event_id: str, design_id: str, payload: OwnerRef) -> dict:
+    try:
+        return service.publish_album_design(event_id, design_id, payload.photographer_id, payload.customer_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+# ------------------------------------------------------------------ customer wedding invitations
+
+
+def _invitation_call(call):
+    try:
+        return call()
+    except InvitationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+class InvitationDetails(BaseModel):
+    photographer_id: str = Field(min_length=1, max_length=128)
+    customer_id: str = Field(min_length=1, max_length=128)
+    details: dict
+
+
+class InvitationFinalize(BaseModel):
+    photographer_id: str = Field(min_length=1, max_length=128)
+    customer_id: str = Field(min_length=1, max_length=128)
+    index: int = Field(ge=0, le=20)
+
+
+@app.get("/api/v1/events/{event_id}/invitation", dependencies=[Depends(require_service_key)])
+def get_invitation(event_id: str, photographer_id: str = Query(min_length=1, max_length=128),
+                   customer_id: str = Query(min_length=1, max_length=128)) -> dict:
+    return _invitation_call(lambda: service.invitation(event_id, photographer_id, customer_id))
+
+
+@app.put("/api/v1/events/{event_id}/invitation", dependencies=[Depends(require_service_key)])
+def put_invitation(event_id: str, payload: InvitationDetails) -> dict:
+    return _invitation_call(lambda: service.save_invitation_details(event_id, payload.photographer_id, payload.customer_id, payload.details))
+
+
+@app.post("/api/v1/events/{event_id}/invitation/photo", dependencies=[Depends(require_service_key)])
+async def post_invitation_photo(event_id: str, photographer_id: str = Query(min_length=1, max_length=128),
+                                customer_id: str = Query(min_length=1, max_length=128),
+                                file: UploadFile = File(...)) -> dict:
+    data = await file.read(25 * 1024 * 1024 + 1)
+    return await run_in_threadpool(_invitation_call, lambda: service.save_invitation_photo(event_id, photographer_id, customer_id, data))
+
+
+@app.delete("/api/v1/events/{event_id}/invitation/photo", dependencies=[Depends(require_service_key)])
+def delete_invitation_photo(event_id: str, photographer_id: str = Query(min_length=1, max_length=128),
+                            customer_id: str = Query(min_length=1, max_length=128)) -> dict:
+    return _invitation_call(lambda: service.delete_invitation_photo(event_id, photographer_id, customer_id))
+
+
+@app.post("/api/v1/events/{event_id}/invitation/designs", dependencies=[Depends(require_service_key)])
+def post_invitation_designs(event_id: str, payload: OwnerRef) -> dict:
+    return _invitation_call(lambda: service.generate_invitation_designs(event_id, payload.photographer_id, payload.customer_id))
+
+
+@app.get("/api/v1/events/{event_id}/invitation/designs/{index}", dependencies=[Depends(require_service_key)])
+def get_invitation_design(event_id: str, index: int, customer_id: str = Query(min_length=1, max_length=128)) -> Response:
+    image = _invitation_call(lambda: service.invitation_preview(event_id, customer_id, index))
+    return Response(content=image, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=600"})
+
+
+@app.post("/api/v1/events/{event_id}/invitation/finalize", dependencies=[Depends(require_service_key)])
+def post_invitation_finalize(event_id: str, payload: InvitationFinalize) -> dict:
+    return _invitation_call(lambda: service.finalize_invitation(event_id, payload.photographer_id, payload.customer_id, payload.index))
+
+
+@app.get("/api/v1/events/{event_id}/invitation/{kind}", dependencies=[Depends(require_service_key)])
+def get_invitation_file(event_id: str, kind: str, customer_id: str = Query(min_length=1, max_length=128)) -> FileResponse:
+    if kind not in {"video", "poster"}:
+        raise HTTPException(status_code=404, detail="Unknown file.")
+    path, cleanup, media_type = _invitation_call(lambda: service.invitation_file(event_id, customer_id, kind))
+    return FileResponse(
+        path,
+        media_type=media_type,
+        filename=f"wedding-invitation.{'mp4' if kind == 'video' else 'jpg'}",
         headers={"Cache-Control": "private, no-store"},
         background=BackgroundTask(lambda: path.unlink(missing_ok=True)) if cleanup else None,
     )
