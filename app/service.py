@@ -6,6 +6,8 @@ import mimetypes
 import os
 import secrets
 import tempfile
+import threading
+import time
 import uuid
 import zipfile
 from dataclasses import dataclass
@@ -19,10 +21,11 @@ from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
 
 from . import jobs
+from . import style as style_engine
 from .config import Settings
 from .db import Database
 from .face_matching import MAX_IMAGE_PIXELS, EventFaceMatcher
-from .imaging import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, ImageProcessor
+from .imaging import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, ImageProcessor, StudioLook
 from .storage import StorageBackend, create_storage, normalize_key, safe_filename, validate_id
 
 logger = logging.getLogger(__name__)
@@ -52,12 +55,15 @@ class PhotoService:
         self.storage: StorageBackend = create_storage(settings)
         self.db = database or Database(settings.database_url, settings.db_pool_size)
         settings.temp_root.mkdir(parents=True, exist_ok=True)
+        self.face_matcher = EventFaceMatcher(settings)
         self.processor = ImageProcessor(
             logo_path=settings.logo_path,
             enhancer_model=settings.enhancer_model,
             max_processed_bytes=settings.max_processed_bytes,
+            face_finder=self.face_matcher.face_boxes if settings.face_matching_enabled else None,
         )
-        self.face_matcher = EventFaceMatcher(settings)
+        self._looks: dict[str, tuple[float, StudioLook]] = {}
+        self._looks_lock = threading.Lock()
 
     # ------------------------------------------------------------------ events and folders
 
@@ -295,8 +301,10 @@ class PhotoService:
                 prefix="processed-", suffix=".jpg", dir=self.settings.temp_root, delete=False
             ) as temporary:
                 processed_path = Path(temporary.name)
+            photographer_id = self._event_owner(media["event_id"])
             try:
-                result = self.processor.process(source, processed_path)
+                result = self.processor.process(source, processed_path, self.studio_look(photographer_id))
+                self._record_baseline(photographer_id, result.get("analysis"))
                 self.storage.upload_file(media["processed_key"], processed_path)
                 embeddings = self._embeddings_or_none(processed_path)
             finally:
@@ -317,6 +325,180 @@ class PhotoService:
             )
             if embeddings is not None:
                 self._store_embeddings_and_match(connection, media, embeddings)
+
+    # ------------------------------------------------------------------ studio look (editing style + logo)
+
+    LOOK_CACHE_SECONDS = 60
+    MAX_REFERENCE_BYTES = 40 * 1024 * 1024
+    PREVIEW_SIDE = 1800
+
+    def _event_owner(self, event_id: str) -> str | None:
+        with self.db.transaction() as connection:
+            row = connection.execute(
+                "SELECT photographer_id FROM fb_data.event WHERE event_id = %s", (event_id,)
+            ).fetchone()
+        return row["photographer_id"] if row else None
+
+    def studio_look(self, photographer_id: str | None) -> StudioLook:
+        """The studio's look and logo, cached briefly so a large upload doesn't hit the database per photo."""
+        if not photographer_id:
+            return StudioLook()
+        now = time.monotonic()
+        with self._looks_lock:
+            cached = self._looks.get(photographer_id)
+            if cached and cached[0] > now:
+                return cached[1]
+        row = self._style_row(photographer_id)
+        look = StudioLook(
+            profile=row["profile"] if row and row["apply_style"] else None,
+            baseline=row["baseline"] if row else None,
+            strength=(row["strength"] if row else 80) / 100.0,
+            logo=self._studio_logo(photographer_id),
+            stamp_logo=row["stamp_logo"] if row else True,
+        )
+        with self._looks_lock:
+            self._looks[photographer_id] = (now + self.LOOK_CACHE_SECONDS, look)
+        return look
+
+    def _forget_look(self, photographer_id: str) -> None:
+        with self._looks_lock:
+            self._looks.pop(photographer_id, None)
+
+    def _style_row(self, photographer_id: str) -> dict | None:
+        with self.db.transaction() as connection:
+            return connection.execute(
+                "SELECT * FROM fb_data.studio_style WHERE photographer_id = %s", (photographer_id,)
+            ).fetchone()
+
+    def _studio_logo(self, photographer_id: str) -> bytes | None:
+        """The logo the studio uploaded in FrameBucket's branding settings (owned by the Java app)."""
+        try:
+            with self.db.transaction() as connection:
+                row = connection.execute(
+                    "SELECT logo FROM public.fb_studio_brand WHERE photographer_id::text = %s",
+                    (photographer_id,),
+                ).fetchone()
+        except Exception:  # the branding table is absent when the service runs on its own
+            logger.debug("Studio branding is unavailable; using the default logo.", exc_info=True)
+            return None
+        return bytes(row["logo"]) if row and row["logo"] else None
+
+    def _record_baseline(self, photographer_id: str | None, analysis: dict | None) -> None:
+        if not photographer_id or not analysis:
+            return
+        try:
+            with self.db.transaction() as connection:
+                row = connection.execute(
+                    "SELECT baseline FROM fb_data.studio_style WHERE photographer_id = %s FOR UPDATE",
+                    (photographer_id,),
+                ).fetchone()
+                baseline = style_engine.update_baseline(row["baseline"] if row else None, analysis)
+                connection.execute(
+                    """
+                    INSERT INTO fb_data.studio_style (photographer_id, baseline) VALUES (%s, %s)
+                    ON CONFLICT (photographer_id) DO UPDATE SET baseline = EXCLUDED.baseline
+                    """,
+                    (photographer_id, Jsonb(baseline)),
+                )
+        except Exception:  # statistics must never fail a photo
+            logger.warning("Could not update the editing baseline for %s.", photographer_id, exc_info=True)
+
+    def studio_style(self, photographer_id: str) -> dict:
+        photographer_id = validate_id(photographer_id, "photographer_id")
+        row = self._style_row(photographer_id)
+        profile = row["profile"] if row else None
+        return {
+            "has_style": bool(profile),
+            "reference_count": row["reference_count"] if row else 0,
+            "strength": row["strength"] if row else 80,
+            "apply_style": row["apply_style"] if row else True,
+            "stamp_logo": row["stamp_logo"] if row else True,
+            "summary": profile.get("summary") if profile else None,
+            "baseline_samples": int((row["baseline"] or {}).get("samples", 0)) if row else 0,
+            "has_logo": self._studio_logo(photographer_id) is not None or self.processor.logo_path is not None,
+            "updated_at": row["updated_at"].isoformat() if row else None,
+        }
+
+    def save_style_references(self, photographer_id: str, references: list[bytes]) -> dict:
+        photographer_id = validate_id(photographer_id, "photographer_id")
+        images = [style_engine.load_reference(data) for data in references]
+        profile = style_engine.build_profile(images)
+        with self.db.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO fb_data.studio_style (photographer_id, profile, reference_count, updated_at)
+                VALUES (%s, %s, %s, now())
+                ON CONFLICT (photographer_id) DO UPDATE
+                SET profile = EXCLUDED.profile, reference_count = EXCLUDED.reference_count,
+                    apply_style = TRUE, updated_at = now()
+                """,
+                (photographer_id, Jsonb(profile), len(images)),
+            )
+        self._forget_look(photographer_id)
+        return self.studio_style(photographer_id)
+
+    def update_style_settings(
+        self, photographer_id: str, strength: int | None, apply_style: bool | None, stamp_logo: bool | None
+    ) -> dict:
+        photographer_id = validate_id(photographer_id, "photographer_id")
+        with self.db.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO fb_data.studio_style (photographer_id, strength, apply_style, stamp_logo, updated_at)
+                VALUES (%s, COALESCE(%s, 80), COALESCE(%s, TRUE), COALESCE(%s, TRUE), now())
+                ON CONFLICT (photographer_id) DO UPDATE
+                SET strength = COALESCE(%s, fb_data.studio_style.strength),
+                    apply_style = COALESCE(%s, fb_data.studio_style.apply_style),
+                    stamp_logo = COALESCE(%s, fb_data.studio_style.stamp_logo),
+                    updated_at = now()
+                """,
+                (photographer_id, strength, apply_style, stamp_logo, strength, apply_style, stamp_logo),
+            )
+        self._forget_look(photographer_id)
+        return self.studio_style(photographer_id)
+
+    def clear_style(self, photographer_id: str) -> dict:
+        photographer_id = validate_id(photographer_id, "photographer_id")
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE fb_data.studio_style SET profile = NULL, reference_count = 0, updated_at = now() "
+                "WHERE photographer_id = %s",
+                (photographer_id,),
+            )
+        self._forget_look(photographer_id)
+        return self.studio_style(photographer_id)
+
+    def style_preview(self, photographer_id: str, filename: str, data: bytes, strength: int | None = None) -> bytes:
+        """Render one sample photo exactly as processing would (look + logo), at preview size."""
+        photographer_id = validate_id(photographer_id, "photographer_id")
+        suffix = Path(filename or "sample.jpg").suffix.lower() or ".jpg"
+        if suffix not in IMAGE_EXTENSIONS:
+            raise ValueError("Preview needs a JPG, PNG, WebP, TIFF or RAW photo.")
+        row = self._style_row(photographer_id)
+        if not row or not row["profile"]:
+            raise ValueError("Upload reference photos first to create the studio look.")
+        with tempfile.NamedTemporaryFile(prefix="preview-", suffix=suffix, dir=self.settings.temp_root,
+                                         delete=False) as temporary:
+            temporary.write(data)
+            source = Path(temporary.name)
+        try:
+            image = self.processor._load(source)
+        except Exception as exc:
+            raise ValueError("That photo could not be opened.") from exc
+        finally:
+            source.unlink(missing_ok=True)
+        image = style_engine.downscale(image, self.PREVIEW_SIDE)
+        look = StudioLook(
+            profile=row["profile"],
+            baseline=row["baseline"],
+            strength=(row["strength"] if strength is None else max(0, min(100, strength))) / 100.0,
+            logo=self._studio_logo(photographer_id),
+            stamp_logo=row["stamp_logo"],
+        )
+        rendered, _ = self.processor.render(image, look)
+        stream = BytesIO()
+        rendered.save(stream, format="JPEG", quality=88, optimize=True, progressive=True)
+        return stream.getvalue()
 
     def scan_faces(self, photo_id: str) -> None:
         """Compute face embeddings for an already processed photo (used for photos imported from JSON)."""

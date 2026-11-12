@@ -3,10 +3,13 @@ from __future__ import annotations
 import io
 import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageStat
 
-from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+from . import style
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +19,20 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".avi"}
 IMAGE_EXTENSIONS = RAW_EXTENSIONS | {
     ".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"
 }
+
+
+FaceBoxes = list[tuple[int, int, int, int]]
+
+
+@dataclass(frozen=True)
+class StudioLook:
+    """Per-studio processing options, loaded by the service for each photo."""
+
+    profile: dict | None = None          # learned look (style.build_profile); None = basic corrections only
+    baseline: dict | None = None         # studio's rolling "before styling" statistics
+    strength: float = 0.8                # 0..1
+    logo: bytes | None = None            # studio logo; None falls back to the operator-wide FB_LOGO_PATH
+    stamp_logo: bool = True
 
 
 class OnnxImageEnhancer:
@@ -118,21 +135,18 @@ class ImageProcessor:
         logo_path: Path | None = None,
         enhancer_model: Path | None = None,
         max_processed_bytes: int | None = None,
+        face_finder: Callable[[Image.Image], FaceBoxes] | None = None,
     ) -> None:
         self.logo_path = logo_path if logo_path and logo_path.is_file() else None
         self.max_processed_bytes = max_processed_bytes
         self.enhancer = OnnxImageEnhancer(enhancer_model) if enhancer_model else None
         self.face_detector = FaceDetector()
+        self.face_finder = face_finder
 
-    def process(self, source: Path, destination: Path) -> dict[str, int | bool]:
+    def process(self, source: Path, destination: Path, look: StudioLook | None = None) -> dict:
         image = self._load(source)
         source_size = image.size
-
-        if self.enhancer:
-            image = self.enhancer.enhance(image)
-
-        image = self._balance_and_detail(image)
-        watermarked = self._apply_logo(image) if self.logo_path else False
+        image, info = self.render(image, look or StudioLook())
 
         destination.parent.mkdir(parents=True, exist_ok=True)
         target_bytes = max(1, source.stat().st_size - 1)
@@ -152,9 +166,67 @@ class ImageProcessor:
             "original_width": source_size[0],
             "original_height": source_size[1],
             "bytes": len(encoded),
-            "watermarked": watermarked,
-            "ai_enhanced": self.enhancer is not None,
+            "watermarked": info["watermarked"],
+            "ai_enhanced": self.enhancer is not None or info["styled"],
+            "styled": info["styled"],
+            "analysis": info["analysis"],
         }
+
+    def render(self, image: Image.Image, look: StudioLook) -> tuple[Image.Image, dict]:
+        """Basic corrections, then the studio look, then sharpening and the face-safe logo."""
+        if self.enhancer:
+            image = self.enhancer.enhance(image)
+        image = self._balance(image)
+        analysis = style.analyze(image)
+        faces: FaceBoxes | None = None
+
+        styled = False
+        if look.profile and look.strength > 0:
+            faces = self._faces(image)
+            image = style.apply_style(image, look.profile, look.baseline, look.strength, faces or [])
+            styled = True
+        image = self._sharpen(image)
+
+        watermarked = False
+        logo = self._logo_image(look)
+        if logo is not None:
+            if faces is None:
+                faces = self._faces(image)
+            watermarked = self._apply_logo(image, logo, faces)
+        return image, {"styled": styled, "watermarked": watermarked, "analysis": analysis}
+
+    def _faces(self, image: Image.Image) -> FaceBoxes | None:
+        """Faces from the YuNet model plus the Haar cascade (union, for recall); None if neither works."""
+        boxes: FaceBoxes = []
+        found_any_detector = False
+        if self.face_finder is not None:
+            try:
+                boxes.extend(self.face_finder(image))
+                found_any_detector = True
+            except Exception:  # model download or runtime failure: fall back to the cascade
+                logger.warning("Face model unavailable for logo placement; using the fallback detector.",
+                               exc_info=True)
+        if self.face_detector.ready:
+            small = style.downscale(image, 1600)
+            ratio = image.width / small.width
+            boxes.extend((int(x * ratio), int(y * ratio), int(w * ratio), int(h * ratio))
+                         for x, y, w, h in self.face_detector.boxes(small))
+            found_any_detector = True
+        return boxes if found_any_detector else None
+
+    def _logo_image(self, look: StudioLook) -> Image.Image | None:
+        if not look.stamp_logo:
+            return None
+        try:
+            if look.logo:
+                with Image.open(io.BytesIO(look.logo)) as opened:
+                    return opened.convert("RGBA")
+            if self.logo_path:
+                with Image.open(self.logo_path) as opened:
+                    return opened.convert("RGBA")
+        except (OSError, Image.DecompressionBombError):
+            logger.warning("The studio logo could not be read; skipping it.")
+        return None
 
     @staticmethod
     def _load(source: Path) -> Image.Image:
@@ -178,68 +250,95 @@ class ImageProcessor:
             return ImageOps.exif_transpose(opened).convert("RGB")
 
     @staticmethod
-    def _balance_and_detail(image: Image.Image) -> Image.Image:
+    def _balance(image: Image.Image) -> Image.Image:
         # Gentle exposure/color/contrast corrections keep the original look.
         image = ImageOps.autocontrast(image, cutoff=0.35)
         luminance = ImageOps.grayscale(image).resize((1, 1)).getpixel((0, 0))
         brightness_factor = 1.08 if luminance < 92 else 0.98 if luminance > 185 else 1.02
         image = ImageEnhance.Brightness(image).enhance(brightness_factor)
         image = ImageEnhance.Color(image).enhance(1.045)
-        image = ImageEnhance.Contrast(image).enhance(1.035)
+        return ImageEnhance.Contrast(image).enhance(1.035)
+
+    @staticmethod
+    def _sharpen(image: Image.Image) -> Image.Image:
         return image.filter(ImageFilter.UnsharpMask(radius=1.2, percent=115, threshold=4))
 
-    def _apply_logo(self, image: Image.Image) -> bool:
-        # If face detection is unavailable, omit the logo instead of guessing a
-        # position that could cover a face.
-        if not self.face_detector.ready or not self.logo_path:
+    @classmethod
+    def _balance_and_detail(cls, image: Image.Image) -> Image.Image:
+        return cls._sharpen(cls._balance(image))
+
+    # Preferred corners first; the centre-bottom/top spots are used only when every corner has a face.
+    _LOGO_SPOTS = ("bottom-right", "bottom-left", "top-right", "top-left", "bottom-center", "top-center")
+
+    def _apply_logo(self, image: Image.Image, logo: Image.Image, faces: FaceBoxes | None) -> bool:
+        """Stamp the logo where it cannot cover a face. If faces can't be detected, skip it."""
+        if faces is None:
             logger.warning("Skipping logo: face detection is unavailable.")
             return False
 
-        with Image.open(self.logo_path) as opened_logo:
-            logo = opened_logo.convert("RGBA")
-
-        max_width = max(1, int(image.width * 0.14))
-        max_height = max(1, int(image.height * 0.06))
-        logo.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
-        alpha = logo.getchannel("A").point(lambda value: round(value * 0.62))
-        logo.putalpha(alpha)
-
+        # Keep-out zones: each face plus hair/headpiece above, chin and neck below.
+        zones = [(fx - fw * 0.45, fy - fh * 0.6, fx + fw * 1.45, fy + fh * 1.5) for fx, fy, fw, fh in faces]
         margin = max(12, int(min(image.size) * 0.025))
-        positions = [
-            (margin, margin),
-            (image.width - logo.width - margin, margin),
-            (margin, image.height - logo.height - margin),
-            (image.width - logo.width - margin, image.height - logo.height - margin),
-            ((image.width - logo.width) // 2, image.height - logo.height - margin),
-        ]
-        faces = self.face_detector.boxes(image)
         gray = ImageOps.grayscale(image)
-        candidates: list[tuple[float, tuple[int, int]]] = []
+        logo_level = self._logo_level(logo)
 
-        for x, y in positions:
-            rect = (x, y, x + logo.width, y + logo.height)
-            overlaps_face = False
-            for fx, fy, fw, fh in faces:
-                pad_x, pad_y = int(fw * 0.18), int(fh * 0.18)
-                face = (fx - pad_x, fy - pad_y, fx + fw + pad_x, fy + fh + pad_y)
-                intersection = max(0, min(rect[2], face[2]) - max(rect[0], face[0])) * max(
-                    0, min(rect[3], face[3]) - max(rect[1], face[1])
-                )
-                if intersection:
-                    overlaps_face = True
-                    break
-            if overlaps_face:
-                continue
-            patch = gray.crop(rect).resize((8, 8))
-            candidates.append((image_stat_variance(patch), (x, y)))
+        for scale in (1.0, 0.8, 0.65):
+            mark = logo.copy()
+            mark.thumbnail((max(1, int(image.width * 0.14 * scale)), max(1, int(image.height * 0.06 * scale))),
+                           Image.Resampling.LANCZOS)
+            spots = {
+                "bottom-right": (image.width - mark.width - margin, image.height - mark.height - margin),
+                "bottom-left": (margin, image.height - mark.height - margin),
+                "top-right": (image.width - mark.width - margin, margin),
+                "top-left": (margin, margin),
+                "bottom-center": ((image.width - mark.width) // 2, image.height - mark.height - margin),
+                "top-center": ((image.width - mark.width) // 2, margin),
+            }
+            candidates: list[tuple[float, tuple[int, int]]] = []
+            for preference, name in enumerate(self._LOGO_SPOTS):
+                x, y = spots[name]
+                pad = margin // 2
+                rect = (x - pad, y - pad, x + mark.width + pad, y + mark.height + pad)
+                if any(min(rect[2], z[2]) > max(rect[0], z[0]) and min(rect[3], z[3]) > max(rect[1], z[1])
+                       for z in zones):
+                    continue
+                patch = gray.crop(rect)
+                busyness = image_stat_variance(patch.resize((16, 16))) ** 0.5
+                # Prefer calm areas where the logo stands out, then the preferred corner.
+                contrast = abs(logo_level - ImageStat.Stat(patch).mean[0])
+                legibility_penalty = max(0.0, 90.0 - contrast) * 0.5
+                candidates.append((busyness + legibility_penalty + preference * 6.0, (x, y)))
+            if candidates:
+                _, position = min(candidates, key=lambda candidate: candidate[0])
+                self._paste_logo(image, mark, position)
+                return True
 
-        if not candidates:
-            logger.info("Skipping logo because every candidate area overlaps a face.")
-            return False
+        logger.info("Skipping logo because every candidate area is too close to a face.")
+        return False
 
-        _, position = min(candidates, key=lambda candidate: candidate[0])
-        image.paste(logo, position, logo)
-        return True
+    @staticmethod
+    def _logo_level(mark: Image.Image) -> float:
+        solid = mark.getchannel("A").point(lambda value: 255 if value > 128 else 0)
+        gray = ImageOps.grayscale(mark.convert("RGB"))
+        return (ImageStat.Stat(gray, solid) if solid.getbbox() else ImageStat.Stat(gray)).mean[0]
+
+    @staticmethod
+    def _paste_logo(image: Image.Image, mark: Image.Image, position: tuple[int, int]) -> None:
+        alpha = mark.getchannel("A")
+        box = (position[0], position[1], position[0] + mark.width, position[1] + mark.height)
+        backdrop_level = ImageStat.Stat(ImageOps.grayscale(image.crop(box))).mean[0]
+        logo_level = ImageProcessor._logo_level(mark)
+        if abs(logo_level - backdrop_level) < 90:
+            # Low contrast: a soft halo keeps the logo readable without drawing a hard box.
+            halo_colour = (0, 0, 0) if logo_level > 127 else (255, 255, 255)
+            radius = max(2, mark.height // 10)
+            halo_alpha = alpha.filter(ImageFilter.MaxFilter(3)).filter(ImageFilter.GaussianBlur(radius))
+            halo = Image.new("RGBA", mark.size, halo_colour + (0,))
+            halo.putalpha(halo_alpha.point(lambda value: round(value * 0.55)))
+            image.paste(halo, position, halo)
+        faded = mark.copy()
+        faded.putalpha(alpha.point(lambda value: round(value * 0.72)))
+        image.paste(faded, position, faded)
 
     def _encode_jpeg(self, image: Image.Image, target_bytes: int) -> bytes:
         quality = 94

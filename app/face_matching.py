@@ -72,6 +72,42 @@ class EventFaceMatcher:
                     matched.add(guest_id)
         return sorted(matched)
 
+    def face_boxes(self, image: Image.Image) -> list[tuple[int, int, int, int]]:
+        """Face rectangles (x, y, w, h) in ``image`` pixels, tuned for recall rather than precision.
+
+        Used to keep the studio logo and colour grading away from faces, so a missed face is worse than
+        a false alarm: the threshold is lower than the one used for guest matching and small faces count.
+        """
+        detector = self._logo_detector()
+        rgb = image.convert("RGB")
+        scale = 1.0
+        if max(rgb.size) > 1600:
+            scale = 1600 / max(rgb.size)
+            rgb = rgb.resize((max(1, round(rgb.width * scale)), max(1, round(rgb.height * scale))),
+                             Image.Resampling.BILINEAR)
+        frame = cv2.cvtColor(np.asarray(rgb), cv2.COLOR_RGB2BGR)
+        with self._lock:
+            detector.setInputSize((frame.shape[1], frame.shape[0]))
+            _, detections = detector.detect(frame)
+        if detections is None:
+            return []
+        boxes = []
+        for face in detections:
+            x, y, w, h = (float(v) / scale for v in face[:4])
+            if w >= 10 / scale and h >= 10 / scale:
+                boxes.append((int(x), int(y), int(w), int(h)))
+        return boxes
+
+    def _logo_detector(self):
+        with self._lock:
+            if getattr(self, "_recall_detector", None) is not None:
+                return self._recall_detector
+            self.settings.face_model_dir.mkdir(parents=True, exist_ok=True)
+            detector_path = self.settings.face_model_dir / DETECTOR_FILENAME
+            self._ensure_model(detector_path, self.settings.face_detector_model_url, 5 * 1024 * 1024)
+            self._recall_detector = cv2.FaceDetectorYN.create(str(detector_path), "", (320, 320), 0.6, 0.3, 5000)
+            return self._recall_detector
+
     def _models(self):
         with self._lock:
             if self._detector is not None and self._recognizer is not None:

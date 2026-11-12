@@ -19,6 +19,7 @@ from . import jobs
 from .config import Settings
 from .imaging import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
 from .service import AlbumNotReady, DirectDownload, PhotoService
+from .style import MAX_REFERENCES, StyleError
 from .storage import safe_filename
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -87,6 +88,12 @@ class UploadInit(BaseModel):
     filename: str = Field(min_length=1, max_length=255)
     size_bytes: int = Field(gt=0)
     content_type: str | None = Field(default=None, max_length=255)
+
+
+class StyleSettings(BaseModel):
+    strength: int | None = Field(default=None, ge=0, le=100)
+    apply_style: bool | None = None
+    stamp_logo: bool | None = None
 
 
 class OutboxClaim(BaseModel):
@@ -288,6 +295,74 @@ async def _receive_body(request: Request) -> Path:
         path.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
     return path
+
+
+# ------------------------------------------------------------------ studio look (editing style + logo)
+
+@app.get("/api/v1/studios/{photographer_id}/style", dependencies=[Depends(require_service_key)])
+def get_studio_style(photographer_id: str) -> dict:
+    try:
+        return service.studio_style(photographer_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/studios/{photographer_id}/style/references", dependencies=[Depends(require_service_key)])
+async def upload_style_references(photographer_id: str, files: list[UploadFile] = File(...)) -> dict:
+    try:
+        if len(files) > MAX_REFERENCES:
+            raise HTTPException(status_code=422, detail=f"Upload at most {MAX_REFERENCES} reference photos.")
+        contents: list[bytes] = []
+        for upload in files:
+            data = await upload.read(service.MAX_REFERENCE_BYTES + 1)
+            if len(data) > service.MAX_REFERENCE_BYTES:
+                raise HTTPException(status_code=413, detail="Each reference photo must be 40 MB or smaller.")
+            if data:
+                contents.append(data)
+        try:
+            return await run_in_threadpool(service.save_style_references, photographer_id, contents)
+        except (StyleError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    finally:
+        for upload in files:
+            await upload.close()
+
+
+@app.put("/api/v1/studios/{photographer_id}/style", dependencies=[Depends(require_service_key)])
+def update_studio_style(photographer_id: str, payload: StyleSettings) -> dict:
+    try:
+        return service.update_style_settings(photographer_id, payload.strength, payload.apply_style, payload.stamp_logo)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/v1/studios/{photographer_id}/style", dependencies=[Depends(require_service_key)])
+def delete_studio_style(photographer_id: str) -> dict:
+    try:
+        return service.clear_style(photographer_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/studios/{photographer_id}/style/preview", dependencies=[Depends(require_service_key)])
+async def preview_studio_style(
+    photographer_id: str,
+    file: UploadFile = File(...),
+    strength: int | None = Query(default=None, ge=0, le=100),
+) -> Response:
+    try:
+        data = await file.read(service.MAX_REFERENCE_BYTES + 1)
+        if not data:
+            raise HTTPException(status_code=400, detail="Choose a sample photo.")
+        if len(data) > service.MAX_REFERENCE_BYTES:
+            raise HTTPException(status_code=413, detail="The sample photo must be 40 MB or smaller.")
+        try:
+            jpeg = await run_in_threadpool(service.style_preview, photographer_id, file.filename or "", data, strength)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return Response(content=jpeg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+    finally:
+        await file.close()
 
 
 @app.post("/api/v1/outbox/claim", dependencies=[Depends(require_service_key)])
