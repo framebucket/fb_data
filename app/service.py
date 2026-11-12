@@ -468,8 +468,8 @@ class PhotoService:
 
     def save_album_selection(self, event_id: str, photographer_id: str, customer_id: str, photo_ids: list[str]) -> dict:
         unique_photo_ids = list(dict.fromkeys(photo_ids))
-        if len(unique_photo_ids) > 5000:
-            raise ValueError("A selection can contain at most 5000 photos.")
+        if len(unique_photo_ids) > 50000:
+            raise ValueError("A selection can contain at most 50000 photos.")
         with self.db.transaction() as connection:
             event = self._owned_event(connection, event_id, photographer_id, customer_id)
             if not unique_photo_ids:

@@ -66,18 +66,18 @@ class FolderCreate(BaseModel):
 class AlbumSubmissionCreate(BaseModel):
     photographer_id: str = Field(min_length=1, max_length=128)
     customer_id: str = Field(min_length=1, max_length=128)
-    photo_ids: list[str] = Field(min_length=1, max_length=5000)
+    photo_ids: list[str] = Field(min_length=1, max_length=50000)
 
 
 class AlbumSelectionUpdate(BaseModel):
     photographer_id: str = Field(min_length=1, max_length=128)
     customer_id: str = Field(min_length=1, max_length=128)
-    photo_ids: list[str] = Field(default_factory=list, max_length=5000)
+    photo_ids: list[str] = Field(default_factory=list, max_length=50000)
 
 
 class GalleryDownloadRequest(BaseModel):
     customer_id: str = Field(min_length=1, max_length=128)
-    photo_ids: list[str] = Field(default_factory=list, max_length=5000)
+    photo_ids: list[str] = Field(default_factory=list, max_length=50000)
 
 
 class UploadInit(BaseModel):
