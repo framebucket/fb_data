@@ -32,6 +32,7 @@ MAX_GUEST_SELFIE_BYTES = 8 * 1024 * 1024
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     service.db.migrate()
+    _configure_bucket_cors()
     embedded = None
     if settings.embedded_worker:
         from .worker import WorkerPool
@@ -44,6 +45,20 @@ async def lifespan(_: FastAPI):
         if embedded:
             embedded.stop()
         service.db.close()
+
+
+def _configure_bucket_cors() -> None:
+    """FB_S3_CORS_ORIGINS=https://app.example.com,https://other -> bucket CORS for browser uploads/downloads."""
+    import os
+
+    origins = [origin.strip().rstrip("/") for origin in os.getenv("FB_S3_CORS_ORIGINS", "").split(",") if origin.strip()]
+    if not origins or not hasattr(service.storage, "ensure_cors"):
+        return
+    try:
+        service.storage.ensure_cors(origins)
+        logging.getLogger(__name__).info("Bucket CORS allows %s", ", ".join(origins))
+    except Exception:
+        logging.getLogger(__name__).exception("Could not set the bucket CORS rules; browser uploads may be blocked.")
 
 
 app = FastAPI(

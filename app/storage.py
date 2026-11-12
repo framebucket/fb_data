@@ -379,6 +379,22 @@ class S3Storage(StorageBackend):
             Config=self.transfer_config,
         )
 
+    def ensure_cors(self, origins: list[str]) -> None:
+        """Allow the web app's origins to PUT (direct uploads) and GET presigned URLs from the browser.
+
+        Without this, browsers block presigned uploads to Railway Buckets / S3 ("upload was interrupted").
+        """
+        self.client.put_bucket_cors(
+            Bucket=self.bucket,
+            CORSConfiguration={"CORSRules": [{
+                "AllowedOrigins": origins,
+                "AllowedMethods": ["GET", "PUT", "HEAD"],
+                "AllowedHeaders": ["*"],
+                "ExposeHeaders": ["ETag"],
+                "MaxAgeSeconds": 3600,
+            }]},
+        )
+
     def presign_put(self, key: str, content_type: str, expires_seconds: int) -> str | None:
         return self.client.generate_presigned_url(
             "put_object",

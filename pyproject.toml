@@ -27,6 +27,7 @@ dependencies = [
 
 [project.optional-dependencies]
 ai = ["onnxruntime>=1.19,<2"]
+test = ["pytest>=8", "httpx>=0.27"]
 
 [project.scripts]
 fb-data-local = "app.cli:main"
@@ -37,3 +38,8 @@ include = ["app*"]
 
 [tool.setuptools.package-data]
 app = ["migrations/*.sql", "assets/fonts/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"
