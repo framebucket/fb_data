@@ -91,6 +91,7 @@ class SpreadPlan:
     ghost_page: int | None = None                 # 0 left, 1 right, None whole spread
     panels: list[Panel] = field(default_factory=list)
     placements: list[Placement] = field(default_factory=list)
+    reference: str | None = None                  # reference design followed for this sheet, if any
 
 
 @dataclass(frozen=True)
@@ -305,7 +306,12 @@ def justified_layout(aspects: Sequence[float], box: Box, gap: float) -> tuple[li
 
 # --------------------------------------------------------------------------- spread planning
 
-def plan_album(photos: Sequence[PhotoInfo], spec: AlbumSpec) -> list[SpreadPlan]:
+def plan_album(photos: Sequence[PhotoInfo], spec: AlbumSpec, references: Sequence[dict] = ()) -> list[SpreadPlan]:
+    """Plan every sheet. ``references`` are layouts from the studio's own reference designs
+    (album_reference.analyse plus "reference_id"); each sheet follows the one that fits its photos best,
+    or the built-in recipes when none fits without heavy cropping."""
+    from . import album_reference
+
     rng = random.Random(spec.seed)
     score_heroes(photos)
     ordered = order_photos(photos)
@@ -314,11 +320,42 @@ def plan_album(photos: Sequence[PhotoInfo], spec: AlbumSpec) -> list[SpreadPlan]
     width, height = spec.size_px
     plans = []
     hero_side = rng.randrange(2)
+    used: dict[int, int] = {}
+    previous: int | None = None
     for index, chunk in enumerate(chunks):
-        plan = _plan_spread(index, chunk, theme, width, height, rng, hero_side)
-        hero_side ^= 1
+        choice, assignment = (None, [])
+        if references:
+            choice, assignment = album_reference.choose(references, [p.aspect for p in chunk], width / height,
+                                                        used, previous)
+        if choice is not None:
+            plan = _plan_from_reference(index, chunk, references[choice], assignment, width, height)
+            used[choice] = used.get(choice, 0) + 1
+        else:
+            plan = _plan_spread(index, chunk, theme, width, height, rng, hero_side)
+            hero_side ^= 1
+        previous = choice
         plans.append(plan)
     return plans
+
+
+def _plan_from_reference(index: int, chunk: list[PhotoInfo], layout: dict, assignment: list[int],
+                         width: int, height: int) -> SpreadPlan:
+    colour = layout.get("background", "#faf7f0").lstrip("#")
+    background = tuple(int(colour[i:i + 2], 16) for i in (0, 2, 4))
+    plan = SpreadPlan(index=index, recipe="reference", background=background,
+                      reference=layout.get("reference_id"))
+    border = max(4, round(height * 0.0045))
+    framed = layout.get("framed") or [False] * len(layout["boxes"])
+    bleed = layout.get("full_bleed") or [False] * len(layout["boxes"])
+    for photo, box_index in zip(chunk, assignment):
+        x, y, w, h = layout["boxes"][box_index]
+        box = (x * width, y * height, w * width, h * height)
+        frame = border if framed[box_index] and not bleed[box_index] else 0
+        if frame:     # keep the white frame inside the spread
+            box = (max(box[0], frame), max(box[1], frame),
+                   min(box[2], width - 2 * frame), min(box[3], height - 2 * frame))
+        plan.placements.append(Placement(photo, box, frame))
+    return plan
 
 
 def _plan_spread(index: int, chunk: list[PhotoInfo], theme: dict, width: int, height: int,
@@ -610,5 +647,6 @@ def seed_for(text: str) -> int:
 
 
 def summary(plans: Sequence[SpreadPlan]) -> list[dict]:
-    return [{"index": p.index, "recipe": p.recipe, "photos": [pl.photo.number for pl in p.placements]}
+    return [{"index": p.index, "recipe": p.recipe, "reference": p.reference,
+             "photos": [pl.photo.number for pl in p.placements]}
             for p in plans]

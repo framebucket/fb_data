@@ -9,6 +9,7 @@ from typing import Callable
 
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageStat
 
+from . import presets as preset_engine
 from . import style
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,8 @@ class StudioLook:
     strength: float = 0.8                # 0..1
     logo: bytes | None = None            # studio logo; None falls back to the operator-wide FB_LOGO_PATH
     stamp_logo: bool = True
+    presets: tuple = ()                  # compiled editing presets; when present one is picked per photo
+    preset_target: dict | None = None    # learned look used to judge presets (even if the look isn't applied)
 
 
 class OnnxImageEnhancer:
@@ -170,18 +173,33 @@ class ImageProcessor:
             "ai_enhanced": self.enhancer is not None or info["styled"],
             "styled": info["styled"],
             "analysis": info["analysis"],
+            "preset": info.get("preset"),
+            "scene": info.get("scene"),
         }
 
     def render(self, image: Image.Image, look: StudioLook) -> tuple[Image.Image, dict]:
         """Basic corrections, then the studio look, then sharpening and the face-safe logo."""
         if self.enhancer:
             image = self.enhancer.enhance(image)
+        before_balance = image
         image = self._balance(image)
         analysis = style.analyze(image)
         faces: FaceBoxes | None = None
 
         styled = False
-        if look.profile and look.strength > 0:
+        chosen = None
+        scene = None
+        if look.presets:
+            # The studio's own presets come first: pick the best one for this photo, keep skin natural.
+            faces = self._faces(image)
+            chosen, reason = preset_engine.choose(image, look.presets, faces or [], look.preset_target or look.profile,
+                                                  before_balance)
+            scene = reason.get("scene")
+            if chosen is not None:
+                protect = style._skin_protection(image, faces or [], image.size)
+                image = preset_engine.apply(image, chosen.lut, 1.0, protect)
+                styled = True
+        elif look.profile and look.strength > 0:
             faces = self._faces(image)
             image = style.apply_style(image, look.profile, look.baseline, look.strength, faces or [])
             styled = True
@@ -193,7 +211,8 @@ class ImageProcessor:
             if faces is None:
                 faces = self._faces(image)
             watermarked = self._apply_logo(image, logo, faces)
-        return image, {"styled": styled, "watermarked": watermarked, "analysis": analysis}
+        return image, {"styled": styled, "watermarked": watermarked, "analysis": analysis,
+                       "preset": chosen.name if chosen else None, "scene": scene}
 
     def _faces(self, image: Image.Image) -> FaceBoxes | None:
         """Faces from the YuNet model plus the Haar cascade (union, for recall); None if neither works."""

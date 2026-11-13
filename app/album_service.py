@@ -210,7 +210,7 @@ class AlbumDesignMixin:
                                 int(row["dpi"]), int(row["seed"]))
         base_look = self.studio_look(row["photographer_id"])
         look = StudioLook(profile=base_look.profile, baseline=base_look.baseline, strength=base_look.strength,
-                          logo=None, stamp_logo=False)
+                          logo=None, stamp_logo=False, presets=base_look.presets, preset_target=base_look.preset_target)
         work_dir = Path(tempfile.mkdtemp(prefix=f"album-{design_id[:8]}-", dir=self.settings.temp_root))
         try:
             infos: list[design.PhotoInfo] = []
@@ -239,7 +239,7 @@ class AlbumDesignMixin:
                         source.unlink(missing_ok=True)
                 self._design_progress(design_id, 1 + int(49 * position / len(photo_rows)))
 
-            plans = design.plan_album(infos, spec)
+            plans = design.plan_album(infos, spec, self.reference_layouts(row["photographer_id"]))
 
             def load(info: design.PhotoInfo) -> Image.Image:
                 with Image.open(work_files[info.photo_id]) as opened:
@@ -265,7 +265,7 @@ class AlbumDesignMixin:
                     preview_key = f"{prefix}/preview-{number:02d}.jpg"
                     self.storage.write_bytes(preview_key, preview_bytes, "image/jpeg")
                     spreads_meta.append({
-                        "index": plan.index, "recipe": plan.recipe, "preview_key": preview_key,
+                        "index": plan.index, "recipe": plan.recipe, "reference": plan.reference, "preview_key": preview_key,
                         "preview_width": small.width, "preview_height": small.height,
                         "preview_bytes": len(preview_bytes),
                         "photos": [p.photo.number for p in plan.placements],

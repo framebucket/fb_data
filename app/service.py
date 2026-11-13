@@ -24,6 +24,8 @@ from . import jobs
 from . import style as style_engine
 from .album_service import AlbumDesignMixin, DesignNotReady  # noqa: F401  (re-exported for the API)
 from .invitation_service import InvitationMixin
+from .preset_service import PresetLimitReached, PresetMixin  # noqa: F401
+from .reference_service import AlbumReferenceMixin, ReferenceLimitReached  # noqa: F401
 from .config import Settings
 from .db import Database
 from .face_matching import MAX_IMAGE_PIXELS, EventFaceMatcher
@@ -51,7 +53,7 @@ class DirectDownload:
     url: str
 
 
-class PhotoService(AlbumDesignMixin, InvitationMixin):
+class PhotoService(AlbumDesignMixin, InvitationMixin, PresetMixin, AlbumReferenceMixin):
     def __init__(self, settings: Settings, database: Database | None = None) -> None:
         self.settings = settings
         self.storage: StorageBackend = create_storage(settings)
@@ -333,11 +335,11 @@ class PhotoService(AlbumDesignMixin, InvitationMixin):
                 """
                 UPDATE fb_data.media
                 SET status = 'READY', width = %s, height = %s, processed_bytes = %s,
-                    watermarked = %s, ai_enhanced = %s, error = NULL, updated_at = now()
+                    watermarked = %s, ai_enhanced = %s, preset_name = %s, scene = %s, error = NULL, updated_at = now()
                 WHERE photo_id = %s
                 """,
                 (result["width"], result["height"], result["bytes"], bool(result["watermarked"]),
-                 bool(result["ai_enhanced"]), photo_id),
+                 bool(result["ai_enhanced"]), result.get("preset"), result.get("scene"), photo_id),
             )
             if embeddings is not None:
                 self._store_embeddings_and_match(connection, media, embeddings)
@@ -365,12 +367,15 @@ class PhotoService(AlbumDesignMixin, InvitationMixin):
             if cached and cached[0] > now:
                 return cached[1]
         row = self._style_row(photographer_id)
+        use_presets = bool(row.get("use_presets", True)) if row else True
         look = StudioLook(
             profile=row["profile"] if row and row["apply_style"] else None,
             baseline=row["baseline"] if row else None,
             strength=(row["strength"] if row else 80) / 100.0,
             logo=self._studio_logo(photographer_id),
             stamp_logo=row["stamp_logo"] if row else True,
+            presets=tuple(self._compiled_presets(photographer_id)) if use_presets else (),
+            preset_target=row["profile"] if row else None,
         )
         with self._looks_lock:
             self._looks[photographer_id] = (now + self.LOOK_CACHE_SECONDS, look)
@@ -425,6 +430,7 @@ class PhotoService(AlbumDesignMixin, InvitationMixin):
         profile = row["profile"] if row else None
         return {
             "has_style": bool(profile),
+            "use_presets": bool(row.get("use_presets", True)) if row else True,
             "reference_count": row["reference_count"] if row else 0,
             "strength": row["strength"] if row else 80,
             "apply_style": row["apply_style"] if row else True,
@@ -1133,6 +1139,7 @@ class PhotoService(AlbumDesignMixin, InvitationMixin):
             "status": media["status"],
             "error": media["error"],
             "ai_enhanced": media["ai_enhanced"],
+            "preset": media.get("preset_name"),
             "watermarked": media["watermarked"],
         }
 

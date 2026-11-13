@@ -18,7 +18,9 @@ from starlette.concurrency import run_in_threadpool
 from . import jobs
 from .config import Settings
 from .imaging import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
-from .service import AlbumNotReady, DesignNotReady, DirectDownload, PhotoService
+from .service import AlbumNotReady, DesignNotReady, DirectDownload, PhotoService, PresetLimitReached, ReferenceLimitReached
+from .presets import PresetError
+from fastapi import Form
 from .style import MAX_REFERENCES, StyleError
 from .invitation import InvitationError
 from .storage import safe_filename
@@ -126,6 +128,15 @@ class StyleSettings(BaseModel):
     strength: int | None = Field(default=None, ge=0, le=100)
     apply_style: bool | None = None
     stamp_logo: bool | None = None
+
+
+class PresetUpdate(BaseModel):
+    name: str | None = Field(default=None, max_length=80)
+    scene: str | None = Field(default=None, max_length=20)
+
+
+class PresetSettings(BaseModel):
+    use_presets: bool
 
 
 class OutboxClaim(BaseModel):
@@ -395,6 +406,134 @@ async def preview_studio_style(
         return Response(content=jpeg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
     finally:
         await file.close()
+
+
+# ------------------------------------------------------------------ editing presets
+
+def _preset_call(call):
+    try:
+        return call()
+    except PresetLimitReached as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (PresetError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/studios/{photographer_id}/presets", dependencies=[Depends(require_service_key)])
+def get_presets(photographer_id: str) -> dict:
+    return _preset_call(lambda: service.studio_presets(photographer_id))
+
+
+@app.post("/api/v1/studios/{photographer_id}/presets", dependencies=[Depends(require_service_key)])
+async def post_preset(
+    photographer_id: str,
+    file: UploadFile = File(...),
+    name: str | None = Form(default=None, max_length=80),
+    scene: str = Form(default="any", max_length=20),
+    limit: int | None = Query(default=None, ge=0, le=1000),
+) -> dict:
+    try:
+        data = await file.read(service.MAX_PRESET_BYTES + 1)
+        if len(data) > service.MAX_PRESET_BYTES:
+            raise HTTPException(status_code=413, detail="Preset files must be 4 MB or smaller.")
+        return await run_in_threadpool(
+            _preset_call, lambda: service.add_preset(photographer_id, file.filename or "", data, name, scene, limit))
+    finally:
+        await file.close()
+
+
+@app.patch("/api/v1/studios/{photographer_id}/presets/{preset_id}", dependencies=[Depends(require_service_key)])
+def patch_preset(photographer_id: str, preset_id: str, payload: PresetUpdate) -> dict:
+    return _preset_call(lambda: service.update_preset(photographer_id, preset_id, payload.name, payload.scene))
+
+
+@app.delete("/api/v1/studios/{photographer_id}/presets/{preset_id}", dependencies=[Depends(require_service_key)])
+def remove_preset(photographer_id: str, preset_id: str) -> dict:
+    return _preset_call(lambda: service.delete_preset(photographer_id, preset_id))
+
+
+@app.put("/api/v1/studios/{photographer_id}/presets/settings", dependencies=[Depends(require_service_key)])
+def put_preset_settings(photographer_id: str, payload: PresetSettings) -> dict:
+    return _preset_call(lambda: service.set_use_presets(photographer_id, payload.use_presets))
+
+
+@app.post("/api/v1/studios/{photographer_id}/presets/preview", dependencies=[Depends(require_service_key)])
+async def post_preset_preview(
+    photographer_id: str,
+    file: UploadFile = File(...),
+    preset_id: str | None = Query(default=None, max_length=64),
+) -> Response:
+    try:
+        data = await file.read(service.MAX_REFERENCE_BYTES + 1)
+        if not data:
+            raise HTTPException(status_code=400, detail="Choose a sample photo.")
+        if len(data) > service.MAX_REFERENCE_BYTES:
+            raise HTTPException(status_code=413, detail="The sample photo must be 40 MB or smaller.")
+        jpeg, info = await run_in_threadpool(
+            _preset_call, lambda: service.preset_preview(photographer_id, file.filename or "", data, preset_id))
+        headers = {"Cache-Control": "no-store", "X-Preset-Name": re.sub(r"[^ -~]", "?", info.get("preset") or ""),
+                   "X-Scene": info.get("scene") or ""}
+        return Response(content=jpeg, media_type="image/jpeg", headers=headers)
+    finally:
+        await file.close()
+
+
+# ------------------------------------------------------------------ reference album designs
+
+MAX_REFERENCE_UPLOADS = 25
+
+
+def _reference_call(call):
+    try:
+        return call()
+    except ReferenceLimitReached as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/studios/{photographer_id}/album-references", dependencies=[Depends(require_service_key)])
+def get_album_references(photographer_id: str) -> dict:
+    return _reference_call(lambda: service.album_references(photographer_id))
+
+
+@app.post("/api/v1/studios/{photographer_id}/album-references", dependencies=[Depends(require_service_key)])
+async def post_album_references(
+    photographer_id: str,
+    files: list[UploadFile] = File(...),
+    limit: int | None = Query(default=None, ge=0, le=1000),
+) -> dict:
+    try:
+        if len(files) > MAX_REFERENCE_UPLOADS:
+            raise HTTPException(status_code=422, detail=f"Upload up to {MAX_REFERENCE_UPLOADS} spreads at a time.")
+        contents = []
+        for upload in files:
+            data = await upload.read(service.MAX_ALBUM_REFERENCE_BYTES + 1)
+            if len(data) > service.MAX_ALBUM_REFERENCE_BYTES:
+                raise HTTPException(status_code=413, detail="Each spread must be 40 MB or smaller.")
+            contents.append((upload.filename or "spread.jpg", data))
+        return await run_in_threadpool(
+            _reference_call, lambda: service.add_album_references(photographer_id, contents, limit))
+    finally:
+        for upload in files:
+            await upload.close()
+
+
+@app.delete("/api/v1/studios/{photographer_id}/album-references/{reference_id}",
+            dependencies=[Depends(require_service_key)])
+def delete_album_reference(photographer_id: str, reference_id: str) -> dict:
+    return _reference_call(lambda: service.delete_album_reference(photographer_id, reference_id))
+
+
+@app.get("/api/v1/studios/{photographer_id}/album-references/{reference_id}/thumb",
+         dependencies=[Depends(require_service_key)])
+def get_album_reference_thumb(photographer_id: str, reference_id: str) -> Response:
+    data = _reference_call(lambda: service.album_reference_thumb(photographer_id, reference_id))
+    return Response(content=data, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
 
 
 @app.post("/api/v1/outbox/claim", dependencies=[Depends(require_service_key)])
